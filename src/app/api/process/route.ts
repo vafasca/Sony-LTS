@@ -644,26 +644,88 @@ async function tryGroqProviders(
 // ═══════════════════════════════════════════════════════════════
 
 function parseJSONResponse<T>(response: string): T | null {
-  try {
-    return JSON.parse(response) as T;
-  } catch {
-    // Buscar JSON en la respuesta
-    const patterns = [
-      /\{[\s\S]*\}/,
-      /```json\s*([\s\S]*?)```/,
-      /```\s*([\s\S]*?)```/,
-    ];
-    
-    for (const pattern of patterns) {
-      const match = response.match(pattern);
-      if (match) {
-        try {
-          let clean = match[0].replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-          return JSON.parse(clean) as T;
-        } catch { continue; }
+  const normalize = (text: string): string => text
+    .replace(/^\uFEFF/, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .trim();
+
+  const tryParse = (raw: string): T | null => {
+    const clean = normalize(raw)
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+
+    try {
+      return JSON.parse(clean) as T;
+    } catch {
+      return null;
+    }
+  };
+
+  // 1) Intento directo
+  const direct = tryParse(response);
+  if (direct) return direct;
+
+  // 2) Intento en bloques markdown
+  const fencedBlocks = [
+    ...response.matchAll(/```json\s*([\s\S]*?)```/gi),
+    ...response.matchAll(/```\s*([\s\S]*?)```/g),
+  ];
+  for (const block of fencedBlocks) {
+    const parsed = tryParse(block[1] || block[0]);
+    if (parsed) return parsed;
+  }
+
+  // 3) Extraer por llaves balanceadas (evita regex greedy/noisy)
+  const text = normalize(response);
+  const candidates: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+
+    if (ch === '}') {
+      if (depth > 0) depth--;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
       }
     }
   }
+
+  for (const candidate of candidates) {
+    const parsed = tryParse(candidate);
+    if (parsed) return parsed;
+  }
+
   return null;
 }
 
