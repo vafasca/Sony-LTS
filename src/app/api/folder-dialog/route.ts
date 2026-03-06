@@ -55,7 +55,11 @@ async function openFolderDialogWindows(): Promise<string | null> {
 
     const { stdout } = await execAsync(
       `powershell -NoProfile -STA -ExecutionPolicy Bypass -EncodedCommand ${encodedScript}`,
-      { timeout: 60000 }
+      {
+        timeout: 15000,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      }
     );
 
     const selectedPath = stdout.trim();
@@ -64,6 +68,11 @@ async function openFolderDialogWindows(): Promise<string | null> {
     }
     return null;
   } catch (error) {
+    const e = error as { killed?: boolean; signal?: string; stderr?: string };
+    if (e?.killed || e?.signal === 'SIGTERM') {
+      console.warn('[FolderDialog] Diálogo cancelado o expirado (timeout).');
+      return null;
+    }
     console.error('[FolderDialog] Error opening dialog:', error);
     return null;
   }

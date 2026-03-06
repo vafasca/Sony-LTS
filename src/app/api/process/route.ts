@@ -820,9 +820,10 @@ REGLAS:
 27. Los comandos de verificación deben usar opciones CLI estables y documentadas (sin flags experimentales)
 28. Los comandos de hardware deben devolver enteros normalizados (Floor o Round)
 29. Antes de usar npm/pip/u otros gestores, verifica si existe paquete en ${systemInfo.gestor_paquetes}; si existe, usa ${systemInfo.gestor_paquetes}
-30. Para tareas de desarrollo web incluye como mínimo un editor de código y un navegador moderno
-31. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
-32. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
+30. Para tareas de desarrollo web incluye como mínimo un editor de código
+31. NO incluyas navegadores web como requisito, ni comandos de verificación/instalación de navegadores
+32. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
+33. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -1208,6 +1209,14 @@ export async function POST(request: NextRequest) {
                 const synthesizedMarker = outputUpper.includes('OUT_OF_RANGE') ? 'OUT_OF_RANGE-INVALID_VERSION' : 'MISSING';
                 result.success = true;
                 result.outputs.push(`[verification] normalized_marker=${synthesizedMarker}; reason=version_parse_error`);
+                continue;
+              }
+
+              if (isVerificationStep && /COMMANDNOTFOUNDEXCEPTION|NO SE RECONOCE COMO NOMBRE DE UN CMDLET|IS NOT RECOGNIZED|OBJECTNOTFOUND|EL T[ÉE]RMINO/i.test(outputUpper)) {
+                // Si el ejecutable no existe, tratar como "MISSING" para pasar a instalación,
+                // en lugar de consumir reintentos con el mismo error.
+                result.success = true;
+                result.outputs.push('[verification] normalized_marker=MISSING; reason=command_not_found');
                 continue;
               }
 
