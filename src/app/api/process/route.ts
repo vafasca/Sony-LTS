@@ -435,6 +435,46 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   console.log(`[executeCommand] Directorio de trabajo: ${commandCwd}`);
   
   try {
+    let commandToRun = cleanedCmd;
+    let executionCwd = commandCwd;
+
+    // Soportar comandos compuestos del tipo:
+    //   cd <ruta>; <comando>
+    //   cd <ruta> && <comando>
+    // para evitar que se interpreten como un único "cd" inválido.
+    const chainedCdPatterns = [
+      /^cd\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+      /^Set-Location\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+      /^sl\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+    ];
+
+    for (const pattern of chainedCdPatterns) {
+      const match = commandToRun.match(pattern);
+      if (!match) continue;
+
+      const targetDir = match[1].trim().replace(/^["']|["']$/g, '');
+      const trailingCommand = (match[2] || '').trim();
+      const newDir = path.isAbsolute(targetDir)
+        ? targetDir
+        : path.join(commandCwd, targetDir);
+
+      try {
+        await fs.access(newDir);
+        sessionState.currentWorkDir = newDir;
+        executionCwd = newDir;
+        commandToRun = trailingCommand;
+        console.log(`[executeCommand] ℹ️ Comando compuesto detectado. cwd=${newDir}; comando=${commandToRun}`);
+      } catch {
+        console.log(`[executeCommand] ❌ Directorio no encontrado en comando compuesto: ${newDir}`);
+        return {
+          success: false,
+          output: `Directorio no encontrado: ${newDir}`,
+          exitCode: 1,
+        };
+      }
+      break;
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // INTERCEPTAR COMANDOS DE CAMBIO DE DIRECTORIO
     // Estos comandos no funcionan entre llamadas porque cada llamada
@@ -443,14 +483,14 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     
     // Patrones de cambio de directorio para diferentes shells
     const cdPatterns = [
-      /^cd\s+(.+)$/i,                                    // bash/cmd: cd ruta
-      /^Set-Location\s+["']?(.+?)["']?\s*$/i,           // PowerShell: Set-Location "ruta"
-      /^sl\s+["']?(.+?)["']?\s*$/i,                     // PowerShell alias: sl ruta
-      /^pushd\s+(.+)$/i,                                // pushd ruta
+      /^cd\s+([^;&]+)\s*$/i,                              // bash/cmd: cd ruta
+      /^Set-Location\s+["']?([^;&]+?)["']?\s*$/i,        // PowerShell: Set-Location "ruta"
+      /^sl\s+["']?([^;&]+?)["']?\s*$/i,                  // PowerShell alias: sl ruta
+      /^pushd\s+([^;&]+)\s*$/i,                           // pushd ruta
     ];
     
     for (const pattern of cdPatterns) {
-      const match = cleanedCmd.match(pattern);
+      const match = commandToRun.match(pattern);
       if (match) {
         let targetDir = match[1].trim().replace(/^["']|["']$/g, '');
         
@@ -515,12 +555,10 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // ═══════════════════════════════════════════════════════════════
     
     let result;
-    let commandToRun = cleanedCmd;
-    let executionCwd = commandCwd;
 
     // Normalizar scaffolding Angular cuando llega una ruta absoluta en "ng new".
     // Angular CLI espera nombre de proyecto (no ruta absoluta) y opcionalmente --directory.
-    const ngNewMatch = cleanedCmd.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
+    const ngNewMatch = commandToRun.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
     if (ngNewMatch) {
       const targetRaw = (ngNewMatch[1] || ngNewMatch[2] || ngNewMatch[3] || '').trim();
       const restArgs = ngNewMatch[4] || '';
