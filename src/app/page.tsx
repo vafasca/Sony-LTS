@@ -92,7 +92,7 @@ interface ExecutionStep {
   id: string;
   numero: number;
   fase?: string;
-  accion: "crear" | "editar" | "eliminar" | "validar" | "corregir";
+  accion: "crear" | "editar" | "eliminar" | "validar" | "corregir" | "verificar" | "instalar" | "actualizar" | "scaffolding";
   descripcion: string;
   status: "pending" | "running" | "success" | "error";
   comandos?: string[];
@@ -100,6 +100,7 @@ interface ExecutionStep {
   validacion?: string;
   progreso?: string;
   output?: string;
+  requisito_origen?: string;
 }
 
 interface Project {
@@ -521,6 +522,7 @@ export default function SonnyAgent() {
         archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
         validacion: (step.validacion as string) || "",
         progreso: (step.progreso as string) || "",
+        requisito_origen: (step.requisito_origen as string) || "",
       }));
 
       setExecutionSteps(steps);
@@ -528,7 +530,7 @@ export default function SonnyAgent() {
 
       // FASE 2: Ejecutar pasos con streaming en tiempo real
       if (steps.length > 0) {
-        const workDir = data.workDir || process.cwd();
+        const workDir = typeof data.workDir === "string" ? data.workDir : "";
         const success = await executeWithStreaming(steps, workDir);
         
         // Obtener conteo del estado actual
@@ -561,6 +563,7 @@ export default function SonnyAgent() {
   // Función para ejecutar pasos con streaming en tiempo real - CON RETRY LOGIC
   const executeWithStreaming = useCallback(async (steps: ExecutionStep[], workDir: string) => {
     const totalSteps = steps.length;
+    const requirementStatus: Record<string, { verified: boolean; output: string; expected: string; metExpectation: boolean }> = {};
     
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -582,10 +585,28 @@ export default function SonnyAgent() {
       };
       setTerminalCommands(prev => [...prev, terminalCmd]);
 
+      // Si ya se verificó el requisito y cumple, omitir instalación/actualización.
+      const reqKey = step.requisito_origen || step.descripcion;
+      if ((step.accion === "instalar" || step.accion === "actualizar") && requirementStatus[reqKey]?.metExpectation) {
+        const verifyInfo = requirementStatus[reqKey];
+        const skipOutput = `⏭️ Instalación omitida para ${reqKey}: ya cumple validación (${verifyInfo.expected || 'OK'}).
+🧾 Verificación previa:
+${verifyInfo.output}`;
+        setTerminalCommands(prev => prev.map((tc, idx) => 
+          idx === prev.length - 1 ? { ...tc, output: `${tc.output}
+${skipOutput}`, status: "success" } : tc
+        ));
+        setExecutionSteps(prev => prev.map((s, idx) => 
+          idx === i ? { ...s, status: "success" as const, output: skipOutput } : s
+        ));
+        continue;
+      }
+
       let stepSuccess = true;
       let stepOutput = "";
       let attemptCount = retryAttempts[i] || 0;
       const maxAttempts = 3;
+      let localRetryAttempts = { ...retryAttempts };
 
       // Ejecutar comandos del paso CON RETRY LOGIC
       if (step.comandos && step.comandos.length > 0) {
@@ -605,8 +626,8 @@ export default function SonnyAgent() {
                     descripcion: step.descripcion,
                     comandos: [cmd],
                   }],
-                  workDir,
-                  retryAttempts,
+                  ...(workDir ? { workDir } : {}),
+                  retryAttempts: localRetryAttempts,
                 }),
               });
 
@@ -615,12 +636,23 @@ export default function SonnyAgent() {
               // Manejar respuesta de error con retry
               if (execData.needsRetry || execData.maxRetriesReached) {
                 attemptCount = execData.currentAttempt || attemptCount + 1;
-                setRetryAttempts(prev => ({ ...prev, [i]: attemptCount }));
+                localRetryAttempts = { ...localRetryAttempts, [i]: attemptCount };
+                setRetryAttempts(localRetryAttempts);
+                const expectedText = step.validacion
+                  ? `\n🎯 Esperado: ${step.validacion}`
+                  : "";
+                const backendMessage = execData.errorReport?.mensaje_error
+                  ? `\n🧾 Respuesta: ${execData.errorReport.mensaje_error}`
+                  : "";
                 
                 // Actualizar terminal con intento
                 setTerminalCommands(prev => prev.map((tc, idx) => 
                   idx === prev.length - 1 
-                    ? { ...tc, output: `${tc.output}\n⚠️ Intento ${attemptCount} de ${maxAttempts} falló`, status: "error" }
+                    ? { 
+                      ...tc, 
+                      output: `${tc.output}\n⚠️ Intento ${attemptCount} de ${maxAttempts} falló\n🛠️ Comando: ${cmd}${backendMessage}${expectedText}`,
+                      status: "error" 
+                    }
                     : tc
                 ));
                 
@@ -649,6 +681,29 @@ export default function SonnyAgent() {
                   
                   return false;
                 }
+
+                // Protección adicional en frontend para evitar bucles infinitos
+                if (attemptCount >= maxAttempts) {
+                  setCurrentError({
+                    stepIndex: i,
+                    fase: step.fase || `Paso ${stepNumber}`,
+                    paso: step.descripcion,
+                    mensaje: execData.errorReport?.mensaje_error || 'Se alcanzó el máximo de intentos',
+                    codigoSalida: execData.errorReport?.codigo_salida || null,
+                    intentos: attemptCount,
+                    maxIntentos: maxAttempts,
+                    output: execData.errorReport?.mensaje_error,
+                  });
+                  setShowErrorDialog(true);
+                  setExecutionSteps(prev => prev.map((s, idx) => 
+                    idx === i ? { 
+                      ...s, 
+                      status: "error" as const,
+                      output: execData.errorReport?.mensaje_error || 'Error'
+                    } : s
+                  ));
+                  return false;
+                }
                 
                 // Reintentar automáticamente después de un pequeño delay
                 await new Promise(resolve => setTimeout(resolve, 1000));
@@ -663,17 +718,38 @@ export default function SonnyAgent() {
                 stepSuccess = result.success;
                 stepOutput = result.outputs?.join("\n") || "";
                 attemptCount = result.retryCount || 0;
+                const expectedText = step.validacion
+                  ? `\n🎯 Esperado: ${step.validacion}`
+                  : "";
+                const statusText = result.success
+                  ? "✅ Resultado: ejecutado correctamente"
+                  : "❌ Resultado: ejecución con error";
                 
                 // Actualizar terminal con resultado
                 setTerminalCommands(prev => prev.map((tc, idx) => 
                   idx === prev.length - 1 
                     ? { 
                       ...tc, 
-                      output: `${tc.output}\n${stepOutput}${attemptCount > 0 ? `\n✅ Completado en intento ${attemptCount}` : ''}`, 
+                      output: `${tc.output}\n🛠️ Comando ejecutado: ${cmd}\n${statusText}${expectedText}\n🧾 Respuesta:\n${stepOutput}${attemptCount > 0 ? `\n✅ Completado en intento ${attemptCount}` : ''}`, 
                       status: result.success ? "success" : "error" 
                     }
                     : tc
                 ));
+
+                if (step.accion === "verificar") {
+                  const expected = (step.validacion || "")
+                    .replace(/^Debe mostrar:\s*/i, "")
+                    .trim();
+                  const metExpectation = result.success && (
+                    !expected || stepOutput.toLowerCase().includes(expected.toLowerCase())
+                  );
+                  requirementStatus[reqKey] = {
+                    verified: true,
+                    output: stepOutput,
+                    expected,
+                    metExpectation,
+                  };
+                }
               }
             } catch (cmdError) {
               stepSuccess = false;

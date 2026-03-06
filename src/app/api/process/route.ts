@@ -13,16 +13,29 @@ const execAsync = promisify(exec);
 
 const isWindows = os.platform() === 'win32';
 
-// Verificar si un comando es específico de PowerShell (cmdlets)
+// Verificar si un comando es específico de PowerShell (cmdlets o script)
 function isPowerShellCmdlet(cmd: string): boolean {
+  const trimmed = cmd.trim();
   const psPatterns = [
     /^Set-Location/i, /^Get-/i, /^New-Item/i, /^Remove-Item/i,
     /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
     /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
     /^Test-Connection/i, /^Start-/i, /^Stop-/i,
     /^\(\s*Get-/i,  // (Get-... expresiones
+    /^try\s*\{/i, /^if\s*\(/i, // bloques de script powershell
+    /^\$[A-Za-z_]/,              // variable powershell al inicio
   ];
-  return psPatterns.some(p => p.test(cmd.trim()));
+
+  if (psPatterns.some(p => p.test(trimmed))) {
+    return true;
+  }
+
+  // Heurísticas para scripts PowerShell inline aunque no inicien por cmdlet
+  return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[version\]/i.test(trimmed)
+    || /\bWrite-Output\b/i.test(trimmed)
+    || /\bSilentlyContinue\b/i.test(trimmed)
+    || /\bcatch\s*\{/i.test(trimmed);
 }
 
 // Limpiar comando - eliminar símbolos de prompt que no son parte del comando
@@ -59,28 +72,70 @@ function cleanCommand(cmd: string): string {
 
 // Ejecutar comando directamente (como en el script que funciona)
 async function runCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  let effectiveCwd = cwd;
+  let cwdWarning = '';
+
+  // En Windows/Git Bash es común que el cwd "recordado" no exista todavía.
+  // Si eso ocurre, hacemos fallback al cwd del proceso para evitar ENOENT.
   try {
-    // Usar execAsync exactamente como en el script que funciona
+    const stats = await fs.stat(cwd);
+    if (!stats.isDirectory()) {
+      throw new Error('cwd no es directorio');
+    }
+  } catch {
+    effectiveCwd = process.cwd();
+    cwdWarning = `[runCommand] ⚠️ cwd inválido (${cwd}). Usando fallback: ${effectiveCwd}\n`;
+  }
+
+  try {
+    // En Windows forzamos cmd.exe para evitar dependencias de shell heredada
+    // (por ejemplo entornos MINGW sin COMSPEC consistente).
     const { stdout, stderr } = await execAsync(cmd, {
-      cwd,
+      cwd: effectiveCwd,
       timeout: 300000,
+      ...(isWindows ? { shell: process.env.ComSpec || 'cmd.exe' } : {}),
     });
-    return { stdout, stderr, code: 0 };
+    return { stdout, stderr: `${cwdWarning}${stderr || ''}`, code: 0 };
   } catch (error: unknown) {
-    const execError = error as { stdout?: string; stderr?: string; code?: number };
-    return { 
-      stdout: execError.stdout || '', 
-      stderr: execError.stderr || '', 
-      code: execError.code || 1 
+    const execError = error as { stdout?: string; stderr?: string; code?: number; message?: string };
+    const stderr = `${cwdWarning}${execError.stderr || execError.message || ''}`;
+    return {
+      stdout: execError.stdout || '',
+      stderr,
+      code: typeof execError.code === 'number' ? execError.code : 1,
     };
   }
 }
 
 // Ejecutar comando PowerShell (para cmdlets específicos)
 async function runPowerShellCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
-  // Para cmdlets de PowerShell, envolver en powershell -Command
-  const psCmd = `powershell -Command "${cmd.replace(/"/g, '\\"')}"`;
-  return runCommand(psCmd, cwd);
+  // Intentar con distintos binarios (Windows/Git Bash/pwsh)
+  // y con flags equivalentes al script manual que sí funciona.
+  const escapedCmd = cmd.replace(/"/g, '\\"');
+  const candidates = [
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `pwsh -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+  ];
+
+  let lastResult = { stdout: '', stderr: 'No se pudo ejecutar PowerShell', code: 1 };
+
+  for (const candidate of candidates) {
+    const result = await runCommand(candidate, cwd);
+
+    // ENOENT suele indicar que ese ejecutable no existe en PATH.
+    const output = `${result.stdout}\n${result.stderr}`;
+    const isMissingExecutable = result.code === 1 && /ENOENT|not found|is not recognized/i.test(output);
+
+    if (!isMissingExecutable) {
+      return result;
+    }
+
+    lastResult = result;
+  }
+
+  return lastResult;
 }
 
 /**
@@ -666,10 +721,23 @@ REGLAS:
 13. Los requisitos de tipo hardware nunca deben tener instalar_automaticamente: true
 14. Los requisitos con obligatorio: false deben tener instalar_automaticamente: false
 15. Si RAM o disco son insuficientes, indícalo en "alertas_entorno" como crítico
-16. El campo salida_esperada en software debe reflejar el prefijo exacto de la version_minima
-17. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
-18. Sé minimalista: solo lo estrictamente necesario
-19. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+16. Para requisitos de software, comando_verificacion debe devolver un marcador inequívoco en stdout: "OK-<version>", "OUT_OF_RANGE-<version>" o "MISSING"
+17. Para software, salida_esperada debe ser "OK" para que el agente decida instalar solo cuando NO aparezca "OK"
+18. En PowerShell usa comparación semántica con [version] y evalúa rango compatible: mínimo version_minima y máximo version_recomendada (si existe)
+19. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
+20. Sé minimalista: solo lo estrictamente necesario
+21. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+22. Si el objetivo es una landing page, sitio informativo o página estática, prioriza HTML + CSS + JavaScript sin frameworks SPA, salvo que el usuario pida explícitamente lo contrario
+23. Frameworks SPA (Angular, React, Vue) solo deben elegirse si hay autenticación, dashboard, estado complejo o interacción avanzada
+24. Nunca declares como requisito un software que ya se instala automáticamente por otro requisito listado
+25. Si una dependencia provee otra (ej: Node.js provee npm), declara solo la dependencia principal
+26. Si version_recomendada existe, comando_verificacion de software debe validar rango completo: version_minima <= version <= version_recomendada
+27. Los comandos de verificación deben usar opciones CLI estables y documentadas (sin flags experimentales)
+28. Los comandos de hardware deben devolver enteros normalizados (Floor o Round)
+29. Antes de usar npm/pip/u otros gestores, verifica si existe paquete en ${systemInfo.gestor_paquetes}; si existe, usa ${systemInfo.gestor_paquetes}
+30. Para tareas de desarrollo web incluye como mínimo un editor de código y un navegador moderno
+31. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
+32. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -707,8 +775,8 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
       "comparador": "[>= | > | == | null]",
       "comparador_error": "[< | <= | null]",
       "unidad": "[GB | MB | null]",
-      "comando_verificacion": "[comando en ${systemInfo.shell_disponible} o null]",
-      "salida_esperada": "[prefijo version | numero | null]",
+      "comando_verificacion": "[comando en ${systemInfo.shell_disponible} o null; para software devuelve OK/OUT_OF_RANGE/MISSING]",
+      "salida_esperada": "["OK" para software | numero para hardware | null]",
       "salida_error": "[numero | null]",
       "accion_si_falta": "[instalar | actualizar | configurar | adquirir | liberar | ignorar]",
       "comando_instalacion": "[comando o null si no es instalar/actualizar]"
@@ -718,7 +786,7 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
   "alertas_entorno": [{ "tipo": "[tipo]", "mensaje": "[descripcion]", "critico": true }],
   "archivos_necesarios": [],
   "credenciales_necesarias": [],
-  "validacion_final": { "comando": "[comando | null]", "salida_esperada": "[resultado | null]", "salida_error": "[error | null]" },
+  "validacion_final": { "comando": "[comando | null]", "salida_esperada": "[OK | ERROR | null]", "salida_error": "[error | null]" },
   "progreso": "0%",
   "siguiente_fase": "1B — configuración e instalación de requisitos faltantes"
 }`;
@@ -969,6 +1037,24 @@ export async function POST(request: NextRequest) {
     if (action === 'execute' && providedSteps) {
       const results = [];
       const maxRetries = 3;
+
+      // Si el frontend envía workDir, sincronizarlo para esta ejecución.
+      if (body.workDir && typeof body.workDir === 'string') {
+        try {
+          const normalizedWorkDir = String(body.workDir).trim();
+          const stats = await fs.stat(normalizedWorkDir);
+
+          // Evitar que en Windows se use "/" proveniente de process.cwd() del frontend (browser).
+          const looksLikeUnixRootInWindows = isWindows && normalizedWorkDir === '/';
+          if (stats.isDirectory() && !looksLikeUnixRootInWindows) {
+            sessionState.currentWorkDir = normalizedWorkDir;
+          } else {
+            console.log(`[Execute] ⚠️ workDir ignorado (${normalizedWorkDir}). Se mantiene: ${sessionState.currentWorkDir}`);
+          }
+        } catch {
+          console.log(`[Execute] ⚠️ workDir recibido no existe: ${body.workDir}. Se mantiene: ${sessionState.currentWorkDir}`);
+        }
+      }
       
       // Recuperar intentos previos del body o usar objeto vacío
       const previousAttempts: Record<number, number> = body.retryAttempts || {};
@@ -996,6 +1082,24 @@ export async function POST(request: NextRequest) {
             result.outputs.push(`$ ${cmd}\n${cmdResult.output}`);
             
             if (!cmdResult.success) {
+              const isVerificationStep = step.accion === 'verificar';
+              const expectedRaw = typeof step.validacion === 'string'
+                ? step.validacion.replace(/^Debe mostrar:\s*/i, '').trim()
+                : '';
+              const expected = expectedRaw || 'OK';
+              const outputUpper = String(cmdResult.output || '').toUpperCase();
+              const hasKnownMarker = outputUpper.includes('OK-') || outputUpper.includes('OUT_OF_RANGE-') || outputUpper.includes('MISSING');
+
+              // Para verificaciones, no depender solo del exit code.
+              // Si hay un marcador conocido, devolvemos éxito técnico del paso para evitar loops,
+              // y dejamos que la capa de validación decida si cumple (OK) o requiere instalar (MISSING/OUT_OF_RANGE).
+              if (isVerificationStep && hasKnownMarker) {
+                const expectationMet = outputUpper.includes(expected.toUpperCase());
+                result.success = true;
+                result.outputs.push(`[verification] expectationMet=${expectationMet}; expected=${expected}`);
+                continue;
+              }
+
               result.success = false;
               
               // Crear ErrorReport
@@ -1237,6 +1341,7 @@ export async function POST(request: NextRequest) {
               descripcion: `Instalar ${req.nombre}${req.version_minima ? ` v${req.version_minima}` : ''}`,
               status: 'pending',
               comandos: [req.comando_instalacion],
+              validacion: `Instalar solo si verificación previa NO cumple: ${req.salida_esperada || 'OK'}`,
               requisito_origen: req.nombre,
             });
           }
@@ -1560,7 +1665,10 @@ export async function POST(request: NextRequest) {
             paso: `Verificar: ${req.nombre}`,
             accion: 'verificar',
             descripcion: `Verificar ${req.nombre}`,
-            status: 'pending', comandos: [req.comando_verificacion],
+            status: 'pending',
+            comandos: [req.comando_verificacion],
+            validacion: `Debe mostrar: ${req.salida_esperada || 'OK'}`,
+            requisito_origen: req.nombre,
           });
         }
         if ((req.accion_si_falta === 'instalar' || req.accion_si_falta === 'actualizar') && req.comando_instalacion) {
@@ -1569,7 +1677,10 @@ export async function POST(request: NextRequest) {
             paso: `Instalar: ${req.nombre}`,
             accion: 'instalar',
             descripcion: `Instalar ${req.nombre}`,
-            status: 'pending', comandos: [req.comando_instalacion],
+            status: 'pending',
+            comandos: [req.comando_instalacion],
+            validacion: `Instalar solo si verificación previa NO cumple: ${req.salida_esperada || 'OK'}`,
+            requisito_origen: req.nombre,
           });
         }
       });
