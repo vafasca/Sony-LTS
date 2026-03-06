@@ -1017,9 +1017,15 @@ export async function POST(request: NextRequest) {
       // Si el frontend envía workDir, sincronizarlo para esta ejecución.
       if (body.workDir && typeof body.workDir === 'string') {
         try {
-          const stats = await fs.stat(body.workDir);
-          if (stats.isDirectory()) {
-            sessionState.currentWorkDir = body.workDir;
+          const normalizedWorkDir = String(body.workDir).trim();
+          const stats = await fs.stat(normalizedWorkDir);
+
+          // Evitar que en Windows se use "/" proveniente de process.cwd() del frontend (browser).
+          const looksLikeUnixRootInWindows = isWindows && normalizedWorkDir === '/';
+          if (stats.isDirectory() && !looksLikeUnixRootInWindows) {
+            sessionState.currentWorkDir = normalizedWorkDir;
+          } else {
+            console.log(`[Execute] ⚠️ workDir ignorado (${normalizedWorkDir}). Se mantiene: ${sessionState.currentWorkDir}`);
           }
         } catch {
           console.log(`[Execute] ⚠️ workDir recibido no existe: ${body.workDir}. Se mantiene: ${sessionState.currentWorkDir}`);
@@ -1052,6 +1058,24 @@ export async function POST(request: NextRequest) {
             result.outputs.push(`$ ${cmd}\n${cmdResult.output}`);
             
             if (!cmdResult.success) {
+              const isVerificationStep = step.accion === 'verificar';
+              const expectedRaw = typeof step.validacion === 'string'
+                ? step.validacion.replace(/^Debe mostrar:\s*/i, '').trim()
+                : '';
+              const expected = expectedRaw || 'OK';
+              const outputUpper = String(cmdResult.output || '').toUpperCase();
+              const hasKnownMarker = outputUpper.includes('OK-') || outputUpper.includes('OUT_OF_RANGE-') || outputUpper.includes('MISSING');
+
+              // Para verificaciones, no depender solo del exit code.
+              // Si hay un marcador conocido, devolvemos éxito técnico del paso para evitar loops,
+              // y dejamos que la capa de validación decida si cumple (OK) o requiere instalar (MISSING/OUT_OF_RANGE).
+              if (isVerificationStep && hasKnownMarker) {
+                const expectationMet = outputUpper.includes(expected.toUpperCase());
+                result.success = true;
+                result.outputs.push(`[verification] expectationMet=${expectationMet}; expected=${expected}`);
+                continue;
+              }
+
               result.success = false;
               
               // Crear ErrorReport

@@ -530,7 +530,7 @@ export default function SonnyAgent() {
 
       // FASE 2: Ejecutar pasos con streaming en tiempo real
       if (steps.length > 0) {
-        const workDir = data.workDir || process.cwd();
+        const workDir = typeof data.workDir === "string" ? data.workDir : "";
         const success = await executeWithStreaming(steps, workDir);
         
         // Obtener conteo del estado actual
@@ -626,7 +626,7 @@ ${skipOutput}`, status: "success" } : tc
                     descripcion: step.descripcion,
                     comandos: [cmd],
                   }],
-                  workDir,
+                  ...(workDir ? { workDir } : {}),
                   retryAttempts: localRetryAttempts,
                 }),
               });
