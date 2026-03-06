@@ -24,6 +24,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
     /^\(\s*Get-/i,  // (Get-... expresiones
     /^try\s*\{/i, /^if\s*\(/i, // bloques de script powershell
     /^\$[A-Za-z_]/,              // variable powershell al inicio
+    /^\[[A-Za-z0-9_.]+\]::/,   // expresiones .NET: [math]::Floor(...), [version]::Parse(... )
   ];
 
   if (psPatterns.some(p => p.test(trimmed))) {
@@ -32,6 +33,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
 
   // Heurísticas para scripts PowerShell inline aunque no inicien por cmdlet
   return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
     || /\[version\]/i.test(trimmed)
     || /\bWrite-Output\b/i.test(trimmed)
     || /\bSilentlyContinue\b/i.test(trimmed)

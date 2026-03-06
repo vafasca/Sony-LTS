@@ -26,36 +26,38 @@ function getCommonFolders(): string[] {
     folders.push('/home/projects', '/var/www');
   }
   
-  // Filtrar solo las que existen
-  return folders.filter(f => {
-    try {
-      fs.access(f);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+  // La validación de existencia se hace de forma asíncrona en el handler GET.
+  return folders;
 }
 
 // Abrir diálogo de selección de carpeta en Windows
 async function openFolderDialogWindows(): Promise<string | null> {
   try {
-    // Usar PowerShell con FolderBrowserDialog
+    // Usar PowerShell con FolderBrowserDialog (evita problemas de escaping con -EncodedCommand)
     const script = `
-      Add-Type -AssemblyName System.Windows.Forms
-      $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-      $dialog.Description = "Selecciona la carpeta del proyecto"
-      $dialog.ShowNewFolderButton = $true
-      if ($dialog.ShowDialog() -eq 'OK') {
-        $dialog.SelectedPath
+      try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        if ($null -eq $dialog) { return }
+
+        $dialog.Description = 'Selecciona la carpeta del proyecto'
+        $dialog.ShowNewFolderButton = $true
+
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+          $dialog.SelectedPath
+        }
+      } catch {
+        Write-Error $_.Exception.Message
       }
     `;
-    
+
+    const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
+
     const { stdout } = await execAsync(
-      `powershell -Command "${script.replace(/\n/g, ' ')}"`,
+      `powershell -NoProfile -STA -ExecutionPolicy Bypass -EncodedCommand ${encodedScript}`,
       { timeout: 60000 }
     );
-    
+
     const selectedPath = stdout.trim();
     if (selectedPath && selectedPath.length > 0) {
       return selectedPath;
