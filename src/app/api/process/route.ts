@@ -59,19 +59,37 @@ function cleanCommand(cmd: string): string {
 
 // Ejecutar comando directamente (como en el script que funciona)
 async function runCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  let effectiveCwd = cwd;
+  let cwdWarning = '';
+
+  // En Windows/Git Bash es común que el cwd "recordado" no exista todavía.
+  // Si eso ocurre, hacemos fallback al cwd del proceso para evitar ENOENT.
   try {
-    // Usar execAsync exactamente como en el script que funciona
+    const stats = await fs.stat(cwd);
+    if (!stats.isDirectory()) {
+      throw new Error('cwd no es directorio');
+    }
+  } catch {
+    effectiveCwd = process.cwd();
+    cwdWarning = `[runCommand] ⚠️ cwd inválido (${cwd}). Usando fallback: ${effectiveCwd}\n`;
+  }
+
+  try {
+    // En Windows forzamos cmd.exe para evitar dependencias de shell heredada
+    // (por ejemplo entornos MINGW sin COMSPEC consistente).
     const { stdout, stderr } = await execAsync(cmd, {
-      cwd,
+      cwd: effectiveCwd,
       timeout: 300000,
+      ...(isWindows ? { shell: process.env.ComSpec || 'cmd.exe' } : {}),
     });
-    return { stdout, stderr, code: 0 };
+    return { stdout, stderr: `${cwdWarning}${stderr || ''}`, code: 0 };
   } catch (error: unknown) {
-    const execError = error as { stdout?: string; stderr?: string; code?: number };
-    return { 
-      stdout: execError.stdout || '', 
-      stderr: execError.stderr || '', 
-      code: execError.code || 1 
+    const execError = error as { stdout?: string; stderr?: string; code?: number; message?: string };
+    const stderr = `${cwdWarning}${execError.stderr || execError.message || ''}`;
+    return {
+      stdout: execError.stdout || '',
+      stderr,
+      code: typeof execError.code === 'number' ? execError.code : 1,
     };
   }
 }
@@ -993,6 +1011,18 @@ export async function POST(request: NextRequest) {
     if (action === 'execute' && providedSteps) {
       const results = [];
       const maxRetries = 3;
+
+      // Si el frontend envía workDir, sincronizarlo para esta ejecución.
+      if (body.workDir && typeof body.workDir === 'string') {
+        try {
+          const stats = await fs.stat(body.workDir);
+          if (stats.isDirectory()) {
+            sessionState.currentWorkDir = body.workDir;
+          }
+        } catch {
+          console.log(`[Execute] ⚠️ workDir recibido no existe: ${body.workDir}. Se mantiene: ${sessionState.currentWorkDir}`);
+        }
+      }
       
       // Recuperar intentos previos del body o usar objeto vacío
       const previousAttempts: Record<number, number> = body.retryAttempts || {};
