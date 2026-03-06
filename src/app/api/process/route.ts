@@ -428,9 +428,11 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   // ═══════════════════════════════════════════════════════════════
   const cleanedCmd = cleanCommand(cmd);
   
+  const commandCwd = sessionState.currentWorkDir;
+
   console.log(`[executeCommand] Ejecutando: ${cleanedCmd}`);
   console.log(`[executeCommand] Shell: ${systemInfo.shell_disponible}`);
-  console.log(`[executeCommand] Directorio de trabajo: ${sessionState.currentWorkDir}`);
+  console.log(`[executeCommand] Directorio de trabajo: ${commandCwd}`);
   
   try {
     // ═══════════════════════════════════════════════════════════════
@@ -455,7 +457,7 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
         // Manejar rutas relativas
         const newDir = path.isAbsolute(targetDir) 
           ? targetDir 
-          : path.join(sessionState.currentWorkDir, targetDir);
+          : path.join(commandCwd, targetDir);
         
         try {
           await fs.access(newDir);
@@ -482,12 +484,12 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // New-Item -ItemType Directory -Path "ruta" -Force
     // ═══════════════════════════════════════════════════════════════
     
-    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+["']?([^"'\s]+)["']?/i);
+    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
     if (mkdirMatch) {
-      const targetPath = mkdirMatch[1];
+      const targetPath = mkdirMatch[1] || mkdirMatch[2] || mkdirMatch[3];
       const fullPath = path.isAbsolute(targetPath) 
         ? targetPath 
-        : path.join(sessionState.currentWorkDir, targetPath);
+        : path.join(commandCwd, targetPath);
       
       try {
         await fs.mkdir(fullPath, { recursive: true });
@@ -517,10 +519,10 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
     if (isWindows && isPowerShellCmdlet(cleanedCmd)) {
       console.log('[executeCommand] Estrategia: PowerShell cmdlet');
-      result = await runPowerShellCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runPowerShellCommand(cleanedCmd, commandCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
-      result = await runCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runCommand(cleanedCmd, commandCwd);
     }
     
     const output = (result.stdout || '') + (result.stderr || '');
@@ -1099,6 +1101,16 @@ export async function POST(request: NextRequest) {
                 const expectationMet = outputUpper.includes(expected.toUpperCase());
                 result.success = true;
                 result.outputs.push(`[verification] expectationMet=${expectationMet}; expected=${expected}`);
+                continue;
+              }
+
+              if (isVerificationStep && /SYSTEM\.VERSION|NO SE PUEDE CONVERTIR EL VALOR|VERSION STRING|VERSION PART/i.test(outputUpper)) {
+                // Algunos comandos de verificación devuelven cadenas no parseables de versión.
+                // No debemos entrar en retry infinito: normalizamos a marcador MISSING/OUT_OF_RANGE para que
+                // la fase de instalación decida qué hacer.
+                const synthesizedMarker = outputUpper.includes('OUT_OF_RANGE') ? 'OUT_OF_RANGE-INVALID_VERSION' : 'MISSING';
+                result.success = true;
+                result.outputs.push(`[verification] normalized_marker=${synthesizedMarker}; reason=version_parse_error`);
                 continue;
               }
 
