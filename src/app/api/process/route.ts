@@ -13,16 +13,29 @@ const execAsync = promisify(exec);
 
 const isWindows = os.platform() === 'win32';
 
-// Verificar si un comando es específico de PowerShell (cmdlets)
+// Verificar si un comando es específico de PowerShell (cmdlets o script)
 function isPowerShellCmdlet(cmd: string): boolean {
+  const trimmed = cmd.trim();
   const psPatterns = [
     /^Set-Location/i, /^Get-/i, /^New-Item/i, /^Remove-Item/i,
     /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
     /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
     /^Test-Connection/i, /^Start-/i, /^Stop-/i,
     /^\(\s*Get-/i,  // (Get-... expresiones
+    /^try\s*\{/i, /^if\s*\(/i, // bloques de script powershell
+    /^\$[A-Za-z_]/,              // variable powershell al inicio
   ];
-  return psPatterns.some(p => p.test(cmd.trim()));
+
+  if (psPatterns.some(p => p.test(trimmed))) {
+    return true;
+  }
+
+  // Heurísticas para scripts PowerShell inline aunque no inicien por cmdlet
+  return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[version\]/i.test(trimmed)
+    || /\bWrite-Output\b/i.test(trimmed)
+    || /\bSilentlyContinue\b/i.test(trimmed)
+    || /\bcatch\s*\{/i.test(trimmed);
 }
 
 // Limpiar comando - eliminar símbolos de prompt que no son parte del comando
@@ -714,6 +727,17 @@ REGLAS:
 19. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
 20. Sé minimalista: solo lo estrictamente necesario
 21. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+22. Si el objetivo es una landing page, sitio informativo o página estática, prioriza HTML + CSS + JavaScript sin frameworks SPA, salvo que el usuario pida explícitamente lo contrario
+23. Frameworks SPA (Angular, React, Vue) solo deben elegirse si hay autenticación, dashboard, estado complejo o interacción avanzada
+24. Nunca declares como requisito un software que ya se instala automáticamente por otro requisito listado
+25. Si una dependencia provee otra (ej: Node.js provee npm), declara solo la dependencia principal
+26. Si version_recomendada existe, comando_verificacion de software debe validar rango completo: version_minima <= version <= version_recomendada
+27. Los comandos de verificación deben usar opciones CLI estables y documentadas (sin flags experimentales)
+28. Los comandos de hardware deben devolver enteros normalizados (Floor o Round)
+29. Antes de usar npm/pip/u otros gestores, verifica si existe paquete en ${systemInfo.gestor_paquetes}; si existe, usa ${systemInfo.gestor_paquetes}
+30. Para tareas de desarrollo web incluye como mínimo un editor de código y un navegador moderno
+31. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
+32. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -762,7 +786,7 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
   "alertas_entorno": [{ "tipo": "[tipo]", "mensaje": "[descripcion]", "critico": true }],
   "archivos_necesarios": [],
   "credenciales_necesarias": [],
-  "validacion_final": { "comando": "[comando | null]", "salida_esperada": "[resultado | null]", "salida_error": "[error | null]" },
+  "validacion_final": { "comando": "[comando | null]", "salida_esperada": "[OK | ERROR | null]", "salida_error": "[error | null]" },
   "progreso": "0%",
   "siguiente_fase": "1B — configuración e instalación de requisitos faltantes"
 }`;
