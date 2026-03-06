@@ -20,9 +20,16 @@ function isPowerShellCmdlet(cmd: string): boolean {
     /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
     /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
     /^Test-Connection/i, /^Start-/i, /^Stop-/i,
-    /^\(\s*Get-/i,
+    /^\(\s*Get-/i, /^\[[A-Za-z0-9_.]+\]::/, /^\$[A-Za-z_]/,
   ];
-  return psPatterns.some(p => p.test(cmd.trim()));
+  const trimmed = cmd.trim();
+  if (psPatterns.some(p => p.test(trimmed))) return true;
+  return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
+    || /\[version\]/i.test(trimmed)
+    || /\bWrite-Output\b/i.test(trimmed)
+    || /\bSilentlyContinue\b/i.test(trimmed)
+    || /\bcatch\s*\{/i.test(trimmed);
 }
 
 // Limpiar comando
@@ -59,7 +66,8 @@ async function runCommand(cmd: string, cwd: string): Promise<{ stdout: string; s
 
 // Ejecutar comando PowerShell
 async function runPowerShellCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
-  const psCmd = `powershell -Command "${cmd.replace(/"/g, '\\"')}"`;
+  const escapedCmd = cmd.replace(/"/g, '\\"');
+  const psCmd = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`;
   return runCommand(psCmd, cwd);
 }
 

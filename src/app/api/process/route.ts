@@ -24,6 +24,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
     /^\(\s*Get-/i,  // (Get-... expresiones
     /^try\s*\{/i, /^if\s*\(/i, // bloques de script powershell
     /^\$[A-Za-z_]/,              // variable powershell al inicio
+    /^\[[A-Za-z0-9_.]+\]::/,   // expresiones .NET: [math]::Floor(...), [version]::Parse(... )
   ];
 
   if (psPatterns.some(p => p.test(trimmed))) {
@@ -32,6 +33,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
 
   // Heurísticas para scripts PowerShell inline aunque no inicien por cmdlet
   return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
     || /\[version\]/i.test(trimmed)
     || /\bWrite-Output\b/i.test(trimmed)
     || /\bSilentlyContinue\b/i.test(trimmed)
@@ -426,9 +428,11 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   // ═══════════════════════════════════════════════════════════════
   const cleanedCmd = cleanCommand(cmd);
   
+  const commandCwd = sessionState.currentWorkDir;
+
   console.log(`[executeCommand] Ejecutando: ${cleanedCmd}`);
   console.log(`[executeCommand] Shell: ${systemInfo.shell_disponible}`);
-  console.log(`[executeCommand] Directorio de trabajo: ${sessionState.currentWorkDir}`);
+  console.log(`[executeCommand] Directorio de trabajo: ${commandCwd}`);
   
   try {
     // ═══════════════════════════════════════════════════════════════
@@ -453,7 +457,7 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
         // Manejar rutas relativas
         const newDir = path.isAbsolute(targetDir) 
           ? targetDir 
-          : path.join(sessionState.currentWorkDir, targetDir);
+          : path.join(commandCwd, targetDir);
         
         try {
           await fs.access(newDir);
@@ -480,12 +484,12 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // New-Item -ItemType Directory -Path "ruta" -Force
     // ═══════════════════════════════════════════════════════════════
     
-    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+["']?([^"'\s]+)["']?/i);
+    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
     if (mkdirMatch) {
-      const targetPath = mkdirMatch[1];
+      const targetPath = mkdirMatch[1] || mkdirMatch[2] || mkdirMatch[3];
       const fullPath = path.isAbsolute(targetPath) 
         ? targetPath 
-        : path.join(sessionState.currentWorkDir, targetPath);
+        : path.join(commandCwd, targetPath);
       
       try {
         await fs.mkdir(fullPath, { recursive: true });
@@ -515,10 +519,10 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
     if (isWindows && isPowerShellCmdlet(cleanedCmd)) {
       console.log('[executeCommand] Estrategia: PowerShell cmdlet');
-      result = await runPowerShellCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runPowerShellCommand(cleanedCmd, commandCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
-      result = await runCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runCommand(cleanedCmd, commandCwd);
     }
     
     const output = (result.stdout || '') + (result.stderr || '');
@@ -640,26 +644,88 @@ async function tryGroqProviders(
 // ═══════════════════════════════════════════════════════════════
 
 function parseJSONResponse<T>(response: string): T | null {
-  try {
-    return JSON.parse(response) as T;
-  } catch {
-    // Buscar JSON en la respuesta
-    const patterns = [
-      /\{[\s\S]*\}/,
-      /```json\s*([\s\S]*?)```/,
-      /```\s*([\s\S]*?)```/,
-    ];
-    
-    for (const pattern of patterns) {
-      const match = response.match(pattern);
-      if (match) {
-        try {
-          let clean = match[0].replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-          return JSON.parse(clean) as T;
-        } catch { continue; }
+  const normalize = (text: string): string => text
+    .replace(/^\uFEFF/, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .trim();
+
+  const tryParse = (raw: string): T | null => {
+    const clean = normalize(raw)
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+
+    try {
+      return JSON.parse(clean) as T;
+    } catch {
+      return null;
+    }
+  };
+
+  // 1) Intento directo
+  const direct = tryParse(response);
+  if (direct) return direct;
+
+  // 2) Intento en bloques markdown
+  const fencedBlocks = [
+    ...response.matchAll(/```json\s*([\s\S]*?)```/gi),
+    ...response.matchAll(/```\s*([\s\S]*?)```/g),
+  ];
+  for (const block of fencedBlocks) {
+    const parsed = tryParse(block[1] || block[0]);
+    if (parsed) return parsed;
+  }
+
+  // 3) Extraer por llaves balanceadas (evita regex greedy/noisy)
+  const text = normalize(response);
+  const candidates: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+
+    if (ch === '}') {
+      if (depth > 0) depth--;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
       }
     }
   }
+
+  for (const candidate of candidates) {
+    const parsed = tryParse(candidate);
+    if (parsed) return parsed;
+  }
+
   return null;
 }
 
@@ -1097,6 +1163,16 @@ export async function POST(request: NextRequest) {
                 const expectationMet = outputUpper.includes(expected.toUpperCase());
                 result.success = true;
                 result.outputs.push(`[verification] expectationMet=${expectationMet}; expected=${expected}`);
+                continue;
+              }
+
+              if (isVerificationStep && /SYSTEM\.VERSION|NO SE PUEDE CONVERTIR EL VALOR|VERSION STRING|VERSION PART/i.test(outputUpper)) {
+                // Algunos comandos de verificación devuelven cadenas no parseables de versión.
+                // No debemos entrar en retry infinito: normalizamos a marcador MISSING/OUT_OF_RANGE para que
+                // la fase de instalación decida qué hacer.
+                const synthesizedMarker = outputUpper.includes('OUT_OF_RANGE') ? 'OUT_OF_RANGE-INVALID_VERSION' : 'MISSING';
+                result.success = true;
+                result.outputs.push(`[verification] normalized_marker=${synthesizedMarker}; reason=version_parse_error`);
                 continue;
               }
 
