@@ -78,9 +78,33 @@ async function runCommand(cmd: string, cwd: string): Promise<{ stdout: string; s
 
 // Ejecutar comando PowerShell (para cmdlets específicos)
 async function runPowerShellCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
-  // Para cmdlets de PowerShell, envolver en powershell -Command
-  const psCmd = `powershell -Command "${cmd.replace(/"/g, '\\"')}"`;
-  return runCommand(psCmd, cwd);
+  // Intentar con distintos binarios (Windows/Git Bash/pwsh)
+  // y con flags equivalentes al script manual que sí funciona.
+  const escapedCmd = cmd.replace(/"/g, '\\"');
+  const candidates = [
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `pwsh -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+    `pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "${escapedCmd}"`,
+  ];
+
+  let lastResult = { stdout: '', stderr: 'No se pudo ejecutar PowerShell', code: 1 };
+
+  for (const candidate of candidates) {
+    const result = await runCommand(candidate, cwd);
+
+    // ENOENT suele indicar que ese ejecutable no existe en PATH.
+    const output = `${result.stdout}\n${result.stderr}`;
+    const isMissingExecutable = result.code === 1 && /ENOENT|not found|is not recognized/i.test(output);
+
+    if (!isMissingExecutable) {
+      return result;
+    }
+
+    lastResult = result;
+  }
+
+  return lastResult;
 }
 
 /**
