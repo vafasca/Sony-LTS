@@ -24,6 +24,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
     /^\(\s*Get-/i,  // (Get-... expresiones
     /^try\s*\{/i, /^if\s*\(/i, // bloques de script powershell
     /^\$[A-Za-z_]/,              // variable powershell al inicio
+    /^\[[A-Za-z0-9_.]+\]::/,   // expresiones .NET: [math]::Floor(...), [version]::Parse(... )
   ];
 
   if (psPatterns.some(p => p.test(trimmed))) {
@@ -32,6 +33,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
 
   // Heurísticas para scripts PowerShell inline aunque no inicien por cmdlet
   return /\$[A-Za-z_][A-Za-z0-9_]*\s*=/.test(trimmed)
+    || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
     || /\[version\]/i.test(trimmed)
     || /\bWrite-Output\b/i.test(trimmed)
     || /\bSilentlyContinue\b/i.test(trimmed)
@@ -426,9 +428,11 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   // ═══════════════════════════════════════════════════════════════
   const cleanedCmd = cleanCommand(cmd);
   
+  const commandCwd = sessionState.currentWorkDir;
+
   console.log(`[executeCommand] Ejecutando: ${cleanedCmd}`);
   console.log(`[executeCommand] Shell: ${systemInfo.shell_disponible}`);
-  console.log(`[executeCommand] Directorio de trabajo: ${sessionState.currentWorkDir}`);
+  console.log(`[executeCommand] Directorio de trabajo: ${commandCwd}`);
   
   try {
     // ═══════════════════════════════════════════════════════════════
@@ -453,7 +457,7 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
         // Manejar rutas relativas
         const newDir = path.isAbsolute(targetDir) 
           ? targetDir 
-          : path.join(sessionState.currentWorkDir, targetDir);
+          : path.join(commandCwd, targetDir);
         
         try {
           await fs.access(newDir);
@@ -480,12 +484,12 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // New-Item -ItemType Directory -Path "ruta" -Force
     // ═══════════════════════════════════════════════════════════════
     
-    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+["']?([^"'\s]+)["']?/i);
+    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
     if (mkdirMatch) {
-      const targetPath = mkdirMatch[1];
+      const targetPath = mkdirMatch[1] || mkdirMatch[2] || mkdirMatch[3];
       const fullPath = path.isAbsolute(targetPath) 
         ? targetPath 
-        : path.join(sessionState.currentWorkDir, targetPath);
+        : path.join(commandCwd, targetPath);
       
       try {
         await fs.mkdir(fullPath, { recursive: true });
@@ -511,14 +515,33 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // ═══════════════════════════════════════════════════════════════
     
     let result;
+    let commandToRun = cleanedCmd;
+    let executionCwd = commandCwd;
+
+    // Normalizar scaffolding Angular cuando llega una ruta absoluta en "ng new".
+    // Angular CLI espera nombre de proyecto (no ruta absoluta) y opcionalmente --directory.
+    const ngNewMatch = cleanedCmd.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
+    if (ngNewMatch) {
+      const targetRaw = (ngNewMatch[1] || ngNewMatch[2] || ngNewMatch[3] || '').trim();
+      const restArgs = ngNewMatch[4] || '';
+      const hasDirectoryArg = /\s--directory(?:\s|=)/i.test(restArgs);
+
+      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/')) && !hasDirectoryArg) {
+        const projectName = path.basename(targetRaw).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
+        const parentDir = path.dirname(targetRaw);
+        commandToRun = `ng new "${projectName}" --directory "${targetRaw}"${restArgs}`;
+        executionCwd = parentDir;
+        console.log(`[executeCommand] ℹ️ Normalizado ng new: ${commandToRun}`);
+      }
+    }
     
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
-    if (isWindows && isPowerShellCmdlet(cleanedCmd)) {
+    if (isWindows && isPowerShellCmdlet(commandToRun)) {
       console.log('[executeCommand] Estrategia: PowerShell cmdlet');
-      result = await runPowerShellCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runPowerShellCommand(commandToRun, executionCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
-      result = await runCommand(cleanedCmd, sessionState.currentWorkDir);
+      result = await runCommand(commandToRun, executionCwd);
     }
     
     const output = (result.stdout || '') + (result.stderr || '');
@@ -640,26 +663,88 @@ async function tryGroqProviders(
 // ═══════════════════════════════════════════════════════════════
 
 function parseJSONResponse<T>(response: string): T | null {
-  try {
-    return JSON.parse(response) as T;
-  } catch {
-    // Buscar JSON en la respuesta
-    const patterns = [
-      /\{[\s\S]*\}/,
-      /```json\s*([\s\S]*?)```/,
-      /```\s*([\s\S]*?)```/,
-    ];
-    
-    for (const pattern of patterns) {
-      const match = response.match(pattern);
-      if (match) {
-        try {
-          let clean = match[0].replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-          return JSON.parse(clean) as T;
-        } catch { continue; }
+  const normalize = (text: string): string => text
+    .replace(/^\uFEFF/, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .trim();
+
+  const tryParse = (raw: string): T | null => {
+    const clean = normalize(raw)
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
+
+    try {
+      return JSON.parse(clean) as T;
+    } catch {
+      return null;
+    }
+  };
+
+  // 1) Intento directo
+  const direct = tryParse(response);
+  if (direct) return direct;
+
+  // 2) Intento en bloques markdown
+  const fencedBlocks = [
+    ...response.matchAll(/```json\s*([\s\S]*?)```/gi),
+    ...response.matchAll(/```\s*([\s\S]*?)```/g),
+  ];
+  for (const block of fencedBlocks) {
+    const parsed = tryParse(block[1] || block[0]);
+    if (parsed) return parsed;
+  }
+
+  // 3) Extraer por llaves balanceadas (evita regex greedy/noisy)
+  const text = normalize(response);
+  const candidates: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+      continue;
+    }
+
+    if (ch === '}') {
+      if (depth > 0) depth--;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, i + 1));
+        start = -1;
       }
     }
   }
+
+  for (const candidate of candidates) {
+    const parsed = tryParse(candidate);
+    if (parsed) return parsed;
+  }
+
   return null;
 }
 
@@ -992,7 +1077,23 @@ export async function POST(request: NextRequest) {
       steps: providedSteps,
       errorReport,
       bloqueActual,
+      projectFolder,
     } = body;
+
+    if (projectFolder && typeof projectFolder === 'string') {
+      const normalizedProjectFolder = projectFolder.trim();
+      if (normalizedProjectFolder) {
+        try {
+          const stats = await fs.stat(normalizedProjectFolder);
+          if (stats.isDirectory()) {
+            sessionState.currentWorkDir = normalizedProjectFolder;
+            console.log(`[Process] Carpeta base del proyecto: ${sessionState.currentWorkDir}`);
+          }
+        } catch {
+          console.log(`[Process] ⚠️ projectFolder inválido: ${normalizedProjectFolder}`);
+        }
+      }
+    }
 
     // Detectar entorno del servidor
     const systemInfo = await detectServerEnvironment();
@@ -1097,6 +1198,16 @@ export async function POST(request: NextRequest) {
                 const expectationMet = outputUpper.includes(expected.toUpperCase());
                 result.success = true;
                 result.outputs.push(`[verification] expectationMet=${expectationMet}; expected=${expected}`);
+                continue;
+              }
+
+              if (isVerificationStep && /SYSTEM\.VERSION|NO SE PUEDE CONVERTIR EL VALOR|VERSION STRING|VERSION PART/i.test(outputUpper)) {
+                // Algunos comandos de verificación devuelven cadenas no parseables de versión.
+                // No debemos entrar en retry infinito: normalizamos a marcador MISSING/OUT_OF_RANGE para que
+                // la fase de instalación decida qué hacer.
+                const synthesizedMarker = outputUpper.includes('OUT_OF_RANGE') ? 'OUT_OF_RANGE-INVALID_VERSION' : 'MISSING';
+                result.success = true;
+                result.outputs.push(`[verification] normalized_marker=${synthesizedMarker}; reason=version_parse_error`);
                 continue;
               }
 
@@ -1370,6 +1481,7 @@ export async function POST(request: NextRequest) {
       const projectName = message?.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30) || `proyecto-${Date.now()}`;
       const projectPath = path.join(sessionState.currentWorkDir, projectName);
       sessionState.projectPath = projectPath;
+      await fs.mkdir(projectPath, { recursive: true });
 
       let browserModule;
       try {
@@ -1403,7 +1515,7 @@ export async function POST(request: NextRequest) {
       }
 
       sessionState.phase2Result = phase2Result;
-      sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+      sessionState.currentWorkDir = projectPath;
 
       // Construir pasos de ejecución
       const executionSteps: ExecutionStep[] = [];
@@ -1453,6 +1565,7 @@ export async function POST(request: NextRequest) {
         phase2Result,
         executionSteps,
         projectPath,
+        workDir: sessionState.currentWorkDir,
         systemInfo,
         rawResponse: promptResult.response,
       });
@@ -1690,6 +1803,7 @@ export async function POST(request: NextRequest) {
     const projectName = message.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30);
     const projectPath = path.join(sessionState.currentWorkDir, projectName);
     sessionState.projectPath = projectPath;
+    await fs.mkdir(projectPath, { recursive: true });
     
     const phase2Prompt = buildPhase2Prompt(systemInfo, message, analysis.decisiones_tomadas, projectPath);
     promptResult = await sendPrompt(phase2Prompt);
@@ -1698,7 +1812,7 @@ export async function POST(request: NextRequest) {
       const phase2Result = parseJSONResponse<Phase2Response>(promptResult.response);
       if (phase2Result) {
         sessionState.phase2Result = phase2Result;
-        sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+        sessionState.currentWorkDir = projectPath;
         
         phase2Result.pasos.forEach((paso, idx) => {
           if (paso.tipo === 'comando' && paso.comando) {
@@ -1728,6 +1842,7 @@ export async function POST(request: NextRequest) {
       analysis,
       interpretation,
       projectPath: sessionState.projectPath,
+      workDir: sessionState.currentWorkDir,
       systemInfo,
     });
 
