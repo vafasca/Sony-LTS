@@ -92,7 +92,7 @@ interface ExecutionStep {
   id: string;
   numero: number;
   fase?: string;
-  accion: "crear" | "editar" | "eliminar" | "validar" | "corregir";
+  accion: "crear" | "editar" | "eliminar" | "validar" | "corregir" | "verificar" | "instalar" | "actualizar" | "scaffolding";
   descripcion: string;
   status: "pending" | "running" | "success" | "error";
   comandos?: string[];
@@ -100,6 +100,7 @@ interface ExecutionStep {
   validacion?: string;
   progreso?: string;
   output?: string;
+  requisito_origen?: string;
 }
 
 interface Project {
@@ -521,6 +522,7 @@ export default function SonnyAgent() {
         archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
         validacion: (step.validacion as string) || "",
         progreso: (step.progreso as string) || "",
+        requisito_origen: (step.requisito_origen as string) || "",
       }));
 
       setExecutionSteps(steps);
@@ -561,6 +563,7 @@ export default function SonnyAgent() {
   // Función para ejecutar pasos con streaming en tiempo real - CON RETRY LOGIC
   const executeWithStreaming = useCallback(async (steps: ExecutionStep[], workDir: string) => {
     const totalSteps = steps.length;
+    const requirementStatus: Record<string, { verified: boolean; output: string; expected: string; metExpectation: boolean }> = {};
     
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -581,6 +584,23 @@ export default function SonnyAgent() {
         timestamp: new Date(),
       };
       setTerminalCommands(prev => [...prev, terminalCmd]);
+
+      // Si ya se verificó el requisito y cumple, omitir instalación/actualización.
+      const reqKey = step.requisito_origen || step.descripcion;
+      if ((step.accion === "instalar" || step.accion === "actualizar") && requirementStatus[reqKey]?.metExpectation) {
+        const verifyInfo = requirementStatus[reqKey];
+        const skipOutput = `⏭️ Instalación omitida para ${reqKey}: ya cumple validación (${verifyInfo.expected || 'OK'}).
+🧾 Verificación previa:
+${verifyInfo.output}`;
+        setTerminalCommands(prev => prev.map((tc, idx) => 
+          idx === prev.length - 1 ? { ...tc, output: `${tc.output}
+${skipOutput}`, status: "success" } : tc
+        ));
+        setExecutionSteps(prev => prev.map((s, idx) => 
+          idx === i ? { ...s, status: "success" as const, output: skipOutput } : s
+        ));
+        continue;
+      }
 
       let stepSuccess = true;
       let stepOutput = "";
@@ -715,6 +735,21 @@ export default function SonnyAgent() {
                     }
                     : tc
                 ));
+
+                if (step.accion === "verificar") {
+                  const expected = (step.validacion || "")
+                    .replace(/^Debe mostrar:\s*/i, "")
+                    .trim();
+                  const metExpectation = result.success && (
+                    !expected || stepOutput.toLowerCase().includes(expected.toLowerCase())
+                  );
+                  requirementStatus[reqKey] = {
+                    verified: true,
+                    output: stepOutput,
+                    expected,
+                    metExpectation,
+                  };
+                }
               }
             } catch (cmdError) {
               stepSuccess = false;

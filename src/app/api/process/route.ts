@@ -708,10 +708,12 @@ REGLAS:
 13. Los requisitos de tipo hardware nunca deben tener instalar_automaticamente: true
 14. Los requisitos con obligatorio: false deben tener instalar_automaticamente: false
 15. Si RAM o disco son insuficientes, indícalo en "alertas_entorno" como crítico
-16. El campo salida_esperada en software debe reflejar el prefijo exacto de la version_minima
-17. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
-18. Sé minimalista: solo lo estrictamente necesario
-19. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+16. Para requisitos de software, comando_verificacion debe devolver un marcador inequívoco en stdout: "OK-<version>", "OUT_OF_RANGE-<version>" o "MISSING"
+17. Para software, salida_esperada debe ser "OK" para que el agente decida instalar solo cuando NO aparezca "OK"
+18. En PowerShell usa comparación semántica con [version] y evalúa rango compatible: mínimo version_minima y máximo version_recomendada (si existe)
+19. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
+20. Sé minimalista: solo lo estrictamente necesario
+21. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -749,8 +751,8 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
       "comparador": "[>= | > | == | null]",
       "comparador_error": "[< | <= | null]",
       "unidad": "[GB | MB | null]",
-      "comando_verificacion": "[comando en ${systemInfo.shell_disponible} o null]",
-      "salida_esperada": "[prefijo version | numero | null]",
+      "comando_verificacion": "[comando en ${systemInfo.shell_disponible} o null; para software devuelve OK/OUT_OF_RANGE/MISSING]",
+      "salida_esperada": "["OK" para software | numero para hardware | null]",
       "salida_error": "[numero | null]",
       "accion_si_falta": "[instalar | actualizar | configurar | adquirir | liberar | ignorar]",
       "comando_instalacion": "[comando o null si no es instalar/actualizar]"
@@ -1291,6 +1293,7 @@ export async function POST(request: NextRequest) {
               descripcion: `Instalar ${req.nombre}${req.version_minima ? ` v${req.version_minima}` : ''}`,
               status: 'pending',
               comandos: [req.comando_instalacion],
+              validacion: `Instalar solo si verificación previa NO cumple: ${req.salida_esperada || 'OK'}`,
               requisito_origen: req.nombre,
             });
           }
@@ -1614,7 +1617,10 @@ export async function POST(request: NextRequest) {
             paso: `Verificar: ${req.nombre}`,
             accion: 'verificar',
             descripcion: `Verificar ${req.nombre}`,
-            status: 'pending', comandos: [req.comando_verificacion],
+            status: 'pending',
+            comandos: [req.comando_verificacion],
+            validacion: `Debe mostrar: ${req.salida_esperada || 'OK'}`,
+            requisito_origen: req.nombre,
           });
         }
         if ((req.accion_si_falta === 'instalar' || req.accion_si_falta === 'actualizar') && req.comando_instalacion) {
@@ -1623,7 +1629,10 @@ export async function POST(request: NextRequest) {
             paso: `Instalar: ${req.nombre}`,
             accion: 'instalar',
             descripcion: `Instalar ${req.nombre}`,
-            status: 'pending', comandos: [req.comando_instalacion],
+            status: 'pending',
+            comandos: [req.comando_instalacion],
+            validacion: `Instalar solo si verificación previa NO cumple: ${req.salida_esperada || 'OK'}`,
+            requisito_origen: req.nombre,
           });
         }
       });
