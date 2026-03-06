@@ -1,0 +1,1637 @@
+browser.py:
+"""
+browser.py — v10  (Fix ChatGPT extracción de código + umbral de detección)
+══════════════════════════════════════════════════════════════════════════════
+HISTORIAL DE FIXES
+──────────────────────────────────────────────────────────────────────────────
+FIX 1 — PASTE LIMPIO:
+  PROBLEMA: Al pegar texto largo en el textarea, a veces se duplicaba.
+  SOLUCIÓN: Un solo intento de paste vía pyperclip + clipboard.
+
+FIX 2 — RESPUESTA NUEVA (render-count, SOLO para Claude):
+  PROBLEMA: multi-turno devolvía siempre la misma respuesta (la anterior).
+  SOLUCIÓN: contar bloques antes de enviar, esperar uno nuevo.
+
+FIX 3 — TIMEOUT EXTENDIDO + ESPERA EXTRA (SOLO para Claude):
+  PROBLEMA: Claude con razonamiento extendido puede tardar 3-5 min.
+  SOLUCIÓN: max_wait=360s + loop extra de hasta 120s si sigue generando.
+
+FIX 4 — EXTRACCIÓN POR-IA TOTALMENTE AISLADA (v9):
+  PROBLEMA: _COUNT_RENDERS_JS y _EXTRACT_NEW_RESPONSE_JS usaban
+  [data-test-render-count], un selector exclusivo de Claude.
+  SOLUCIÓN: Cada entrada de AI_SITES tiene sus propios "count_js" y "extract_js".
+
+FIX 5 — CHATGPT: SELECTOR [class*="action"] DEMASIADO AMPLIO (v10):
+  PROBLEMA RAÍZ 1 — código en una sola línea:
+    El selector `[class*="action"]` eliminaba divs contenedores de bloques
+    de código de ChatGPT (usan clases como "code-action-bar", "actions").
+    Resultado: pre.textContent devolvía string vacío → innerText colapsaba
+    todo el bloque en una línea sin separadores.
+
+  PROBLEMA RAÍZ 2 — ng new no capturado (timeout 180s):
+    El mismo selector eliminaba el bloque que contenía el comando `ng new`.
+    `current` siempre devolvía "" → len("") <= 3 → no_text_count++  hasta
+    timeout → retornaba "No se pudo leer la respuesta." (29 chars).
+
+  SOLUCIÓN:
+    · Reemplazar `button, [class*="action"], [class*="feedback"]` por
+      selectores ESPECÍFICOS de los botones de ChatGPT (data-testid exactos).
+    · Procesar <br> DENTRO de <pre> ANTES de extraer textContent.
+    · Añadir manejo de spans de línea (syntax highlighters que usan
+      display:block via CSS en lugar de \n en text nodes).
+    · Bajar umbral de detección de `len > 40` a `len > 3`.
+    · Aumentar paciencia de `no_text_count >= 12` a `>= 20`.
+"""
+import asyncio, os, sys, time, re
+import pyperclip
+from pathlib import Path
+
+class C:
+    CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"
+    RED="\033[91m";  BOLD="\033[1m";   DIM="\033[2m"; RESET="\033[0m"
+
+SESSIONS_DIR      = Path(__file__).parent.parent / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
+EDGE_PROFILES_DIR = Path(__file__).parent.parent / "perfil_edge"
+EDGE_PROFILES_DIR.mkdir(exist_ok=True)
+
+USE_SYSTEM_CHROME = (os.environ.get("SONNY_USE_SYSTEM_CHROME") or "").strip().lower() in {"1","true","yes","si","sí"}
+CHROME_CDP_URL    = (os.environ.get("SONNY_CHROME_CDP_URL") or "http://127.0.0.1:9222").strip()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN DE SITIOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+AI_SITES = {
+    # ── Claude ────────────────────────────────────────────────────────────────
+    "claude": {
+        "url":          "https://claude.ai/new",
+        "name":         "Claude.ai",
+        "input_sel":    '[contenteditable="true"]',
+        "send_sel":     'button[aria-label="Send message"], button[aria-label="Enviar mensaje"], button[aria-label="Enviar"]',
+        "response_sel": '[data-testid="assistant-message"], .font-claude-message, [class*="font-claude-message"]',
+        "done_sel":     'button[aria-label="Send message"]:not([disabled]), button[aria-label="Enviar mensaje"]:not([disabled]), button[aria-label="Enviar"]:not([disabled])',
+        "session_file": "claude_session",
+        "count_js": r"""
+            () => {
+                return document.querySelectorAll('[data-test-render-count]').length;
+            }
+        """,
+        "extract_js": r"""
+            (prevCount) => {
+                const renders = Array.from(
+                    document.querySelectorAll('[data-test-render-count]')
+                );
+                if (renders.length <= prevCount) return '';
+
+                const newest = renders[renders.length - 1];
+                const responseDiv = newest.querySelector('.font-claude-response') || newest;
+                const clone = responseDiv.cloneNode(true);
+
+                clone.querySelectorAll(
+                    '[data-testid="thinking-block"], .thinking-block, details'
+                ).forEach(t => t.remove());
+
+                return clone.innerText.trim();
+            }
+        """,
+    },
+
+    # ── ChatGPT ───────────────────────────────────────────────────────────────
+    "chatgpt": {
+        "url":          "https://chatgpt.com/",
+        "name":         "ChatGPT",
+        "input_sel":    '#prompt-textarea',
+        "send_sel":     'button[data-testid="send-button"]',
+        "response_sel": '[data-message-author-role="assistant"]',
+        "done_sel":     'button[data-testid="send-button"]:not([disabled])',
+        "session_file": "chatgpt_session",
+
+        # ── count_js: cuenta respuestas completas (no estados "pensando") ─────
+        "count_js": r"""
+            () => {
+                return document.querySelectorAll(
+                    '[data-message-author-role="assistant"]'
+                ).length;
+            }
+        """,
+
+        # ── extract_js v10: FIX selector action + br-inside-pre ──────────────
+        #
+        #  CAMBIOS vs v9:
+        #  1. Reemplaza `button, [class*="action"], [class*="feedback"]` por
+        #     data-testid EXACTOS → ya no elimina contenedores de código.
+        #  2. Procesa <br> DENTRO de <pre> ANTES de leer textContent.
+        #  3. Maneja spans de línea (syntax highlighters sin \n en text nodes).
+        #  4. Fallback a textContent completo si innerText devuelve muy poco.
+        #
+        "extract_js": r"""
+            (prevCount) => {
+                const msgs = Array.from(
+                    document.querySelectorAll('[data-message-author-role="assistant"]')
+                );
+                if (msgs.length <= prevCount) return '';
+
+                const newest = msgs[msgs.length - 1];
+
+                // ── Verificación rápida: hay contenido real? ──────────────────
+                // Usamos el DOM VIVO para verificar antes de clonar
+                const quickText = (newest.innerText || newest.textContent || '').trim();
+                if (!quickText || quickText.length < 2) return '';
+
+                const clone = newest.cloneNode(true);
+
+                // ── FIX 5a: Eliminar SOLO botones específicos de ChatGPT ──────
+                // ANTES (problemático): 'button, [class*="action"], [class*="feedback"]'
+                // Eso eliminaba divs contenedores de bloques de código.
+                // AHORA: solo data-testid exactos de botones de UI.
+                clone.querySelectorAll([
+                    '[data-testid="copy-turn-action-button"]',
+                    '[data-testid="thumbs-up-button"]',
+                    '[data-testid="thumbs-down-button"]',
+                    '[data-testid="voice-play-turn-action-button"]',
+                    '[data-testid="regenerate-button"]',
+                    '[data-testid="read-aloud-turn-action-button"]',
+                    // Botón de copiar dentro del bloque de código (el icono, no el contenido)
+                    '.code-block__copy-button',
+                    '.copybtn',
+                    'button[title="Copy"]',
+                    'button[aria-label="Copy"]',
+                    'button[aria-label="Copiar"]',
+                ].join(', ')).forEach(el => el.remove());
+
+                // ── FIX 5b: Procesar bloques <pre> preservando newlines ───────
+                //
+                // ORDEN CRÍTICO: primero convertir <br> DENTRO del <pre>,
+                // luego añadir \n en spans de línea, luego extraer textContent.
+                // En v9, los <br> globales se procesaban DESPUÉS de que el <pre>
+                // ya había sido reemplazado → los <br> internos quedaban perdidos.
+                //
+                clone.querySelectorAll('pre').forEach(pre => {
+
+                    // Paso A: <br> dentro del <pre> → \n explícito
+                    pre.querySelectorAll('br').forEach(br => {
+                        br.parentNode.replaceChild(
+                            document.createTextNode('\n'), br
+                        );
+                    });
+
+                    // Paso B: Syntax highlighters que usan spans con display:block
+                    // (PrismJS, highlight.js, ChatGPT custom) → añadir \n al final
+                    // de cada span de línea para que textContent los incluya.
+                    // Selectores comunes: .line, [class*="line "], token-line, etc.
+                    const lineSpans = pre.querySelectorAll(
+                        '.line, [class*=" line"], [class^="line"], ' +
+                        '.token-line, .code-line, [data-line]'
+                    );
+                    if (lineSpans.length > 1) {
+                        lineSpans.forEach(span => {
+                            const lastChild = span.lastChild;
+                            // Solo añadir \n si no termina ya con uno
+                            if (!lastChild ||
+                                lastChild.nodeType !== Node.TEXT_NODE ||
+                                !lastChild.textContent.endsWith('\n')) {
+                                span.appendChild(document.createTextNode('\n'));
+                            }
+                        });
+                    }
+
+                    // Paso C: Extraer textContent (ahora incluye \n de A y B)
+                    const rawText = pre.textContent;
+                    const withNewlines = '\n' + rawText + '\n';
+                    pre.parentNode.replaceChild(
+                        document.createTextNode(withNewlines), pre
+                    );
+                });
+
+                // ── FIX 5c: <br> fuera de <pre> (ya procesados los internos) ──
+                clone.querySelectorAll('br').forEach(br => {
+                    br.parentNode.replaceChild(
+                        document.createTextNode('\n'), br
+                    );
+                });
+
+                // ── FIX 5d: <code> inline sin <pre> padre ─────────────────────
+                clone.querySelectorAll('code').forEach(code => {
+                    // Si el code YA estaba dentro de un pre, fue procesado arriba
+                    // y el pre fue reemplazado → este code ya no tiene padre pre
+                    // Solo procesar codes que aún existan en el clone
+                    if (code.isConnected && code.closest('pre') === null) {
+                        const raw = code.textContent;
+                        if (code.parentNode) {
+                            code.parentNode.replaceChild(
+                                document.createTextNode(raw), code
+                            );
+                        }
+                    }
+                });
+
+                const result = clone.innerText.trim();
+
+                // ── Fallback: si innerText devuelve muy poco pero quickText ──
+                // tiene bastante, usar textContent del clone como alternativa
+                if (result.length < 10 && quickText.length > result.length * 2) {
+                    // textContent no aplica CSS pero devuelve todo el texto
+                    const fallback = clone.textContent.trim();
+                    if (fallback.length > result.length) {
+                        return fallback;
+                    }
+                }
+
+                return result;
+            }
+        """,
+    },
+
+    # ── Gemini ────────────────────────────────────────────────────────────────
+    "gemini": {
+        "url":          "https://gemini.google.com/app",
+        "name":         "Gemini",
+        "input_sel":    ".ql-editor",
+        "send_sel":     'button[aria-label="Send message"]',
+        "response_sel": ".model-response-text",
+        "done_sel":     'button[aria-label="Send message"]:not([disabled])',
+        "session_file": "gemini_session",
+        "count_js": r"""
+            () => {
+                return document.querySelectorAll('.model-response-text').length;
+            }
+        """,
+        "extract_js": r"""
+            (prevCount) => {
+                const msgs = Array.from(
+                    document.querySelectorAll('.model-response-text')
+                );
+                if (msgs.length <= prevCount) return '';
+                return msgs[msgs.length - 1].innerText.trim();
+            }
+        """,
+    },
+
+    # ── Qwen ──────────────────────────────────────────────────────────────────
+    "qwen": {
+        "url":          "https://chat.qwen.ai/",
+        "name":         "Qwen",
+        "input_sel":    'textarea',
+        "send_sel":     'button[type="submit"]',
+        "response_sel": ".markdown-body",
+        "done_sel":     'button[type="submit"]:not([disabled])',
+        "session_file": "qwen_session",
+        "count_js": r"""
+            () => {
+                return document.querySelectorAll('.markdown-body').length;
+            }
+        """,
+        "extract_js": r"""
+            (prevCount) => {
+                const msgs = Array.from(
+                    document.querySelectorAll('.markdown-body')
+                );
+                if (msgs.length <= prevCount) return '';
+                return msgs[msgs.length - 1].innerText.trim();
+            }
+        """,
+    },
+}
+
+# ── Helpers de Playwright ──────────────────────────────────────────────────────
+
+def check_playwright() -> bool:
+    try:
+        import playwright; return True
+    except ImportError:
+        return False
+
+def install_playwright():
+    import subprocess
+    print(f"  {C.YELLOW}Instalando Playwright...{C.RESET}")
+    subprocess.run([sys.executable, "-m", "pip", "install", "playwright",
+                    "--break-system-packages", "-q"], check=True)
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    print(f"  {C.GREEN}✅ Playwright instalado{C.RESET}")
+
+
+async def _query_first(page, selector_str: str):
+    for sel in selector_str.split(","):
+        sel = sel.strip()
+        if not sel: continue
+        try:
+            el = await page.query_selector(sel)
+            if el: return el
+        except Exception:
+            continue
+    return None
+
+
+_EXTRACT_ARTIFACT_JS = r"""
+() => {
+  const results = [];
+  const tryFrame = (win, depth) => {
+    if (depth > 3) return;
+    try {
+      const body = win.document.body;
+      if (!body) return;
+      const text = (body.innerText || body.textContent || '').trim();
+      if (text && text.length > 50) results.push(text);
+    } catch(e) {}
+    try {
+      for (const frame of win.frames) tryFrame(frame, depth + 1);
+    } catch(e) {}
+  };
+  for (const iframe of document.querySelectorAll('iframe')) {
+    try { if (iframe.contentWindow) tryFrame(iframe.contentWindow, 0); } catch(e) {}
+  }
+  return results.join('\n\n---ARTIFACT---\n\n');
+}
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BROWSER SESSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BrowserSession:
+    """Sesión de navegador persistente para una IA específica."""
+
+    def __init__(self, site_key: str):
+        if site_key not in AI_SITES:
+            raise ValueError(f"Sitio desconocido: {site_key}. "
+                             f"Opciones: {list(AI_SITES.keys())}")
+        self.site_key             = site_key
+        self.site                 = AI_SITES[site_key]
+        self._browser             = None
+        self._context             = None
+        self._page                = None
+        self._pw                  = None
+        self._started             = False
+        self._using_system_chrome = False
+        self._profile_dir = EDGE_PROFILES_DIR / f"profile_{site_key}"
+        self._profile_dir.mkdir(exist_ok=True)
+
+    # ── Ciclo de vida ──────────────────────────────────────────────────────────
+
+    async def _start_with_system_chrome(self) -> bool:
+        if not USE_SYSTEM_CHROME:
+            return False
+        try:
+            self._browser = await self._pw.chromium.connect_over_cdp(CHROME_CDP_URL)
+            self._using_system_chrome = True
+            contexts      = self._browser.contexts
+            self._context = contexts[0] if contexts else await self._browser.new_context()
+            pages         = self._context.pages
+            self._page    = pages[0] if pages else await self._context.new_page()
+            print(f"  {C.GREEN}✅ Conectado a Chrome real: {CHROME_CDP_URL}{C.RESET}")
+            return True
+        except Exception as e:
+            print(f"  {C.YELLOW}⚠️  CDP falló: {e} — usando Edge persistente{C.RESET}")
+            return False
+
+    async def start(self):
+        if self._started:
+            return self
+
+        if not check_playwright():
+            install_playwright()
+
+        from playwright.async_api import async_playwright
+        self._pw = await async_playwright().start()
+
+        if not await self._start_with_system_chrome():
+            self._context = await self._pw.chromium.launch_persistent_context(
+                str(self._profile_dir),
+                channel="msedge",
+                headless=False,
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                ],
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            pages      = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
+            await self._context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+
+        await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
+        self._started = True
+        return self
+
+    async def close(self):
+        if not self._started:
+            return
+        if not self._using_system_chrome and self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+        if self._pw:
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+        self._browser = self._context = self._page = self._pw = None
+        self._started = self._using_system_chrome = False
+
+    async def __aenter__(self):
+        return await self.start()
+    async def __aexit__(self, *a):
+        await self.close()
+
+    # ── ChatGPT login helpers ──────────────────────────────────────────────────
+
+    def _chatgpt_env_credentials_set(self) -> bool:
+        if self.site_key != "chatgpt": return False
+        return bool((os.environ.get("CHATGPT_EMAIL") or "").strip() and
+                    (os.environ.get("CHATGPT_PASSWORD") or "").strip())
+
+    def _chatgpt_allow_automated_login(self) -> bool:
+        return (os.environ.get("CHATGPT_AUTOMATED_LOGIN") or "").strip().lower() in {"1","true","yes","si","sí"}
+
+    async def _chatgpt_has_login_button(self) -> bool:
+        if self.site_key != "chatgpt": return False
+        for sel in ['button:has-text("Iniciar sesión")', 'a:has-text("Iniciar sesión")',
+                    'button:has-text("Log in")',          'a:has-text("Log in")']:
+            try:
+                if await self._page.query_selector(sel): return True
+            except Exception: pass
+        return False
+
+    async def _wait_until_chatgpt_ready_after_login(self, timeout_s=120) -> bool:
+        if self.site_key != "chatgpt": return True
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                url = (self._page.url or "").lower()
+                if "accounts.google.com" in url or "auth.openai.com" in url:
+                    await asyncio.sleep(1); continue
+                if await self._page.query_selector(self.site["input_sel"]):
+                    if not await self._chatgpt_has_login_button(): return True
+                await self._page.wait_for_timeout(2000)
+            except Exception:
+                await asyncio.sleep(1)
+        return False
+
+    # ── Login manual ───────────────────────────────────────────────────────────
+
+    async def needs_login(self, navigate_if_needed=True) -> bool:
+        page = self._page
+        site = self.site
+        if navigate_if_needed:
+            try:
+                site_host = re.sub(r"^https?://", "", site["url"]).split("/")[0].lower()
+                if site_host not in (page.url or "").lower():
+                    await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(3)
+            except Exception: pass
+        try:
+            if await page.query_selector(site["input_sel"]):
+                return False
+        except Exception: pass
+        return True
+
+    async def wait_for_login(self):
+        site = self.site
+        print(f"\n  {C.YELLOW}🔐 Inicia sesión en {site['name']}.")
+        print(f"  Loguéate y luego vuelve aquí.{C.RESET}")
+        print(f"  {C.CYAN}Presiona ENTER cuando hayas iniciado sesión...{C.RESET}")
+        input()
+        if self.site_key == "chatgpt":
+            await self._wait_until_chatgpt_ready_after_login()
+        print(f"  {C.GREEN}✅ Sesión persistida en {self._profile_dir}{C.RESET}\n")
+
+    # ── Extracción por-IA ──────────────────────────────────────────────────────
+
+    async def _count_responses(self) -> int:
+        try:
+            count = await self._page.evaluate(self.site["count_js"])
+            return int(count or 0)
+        except Exception:
+            return 0
+
+    async def _extract_new_response(self, prev_count: int) -> str:
+        try:
+            texto = await self._page.evaluate(self.site["extract_js"], prev_count)
+            return (texto or "").strip()
+        except Exception:
+            return ""
+
+    # ── Detección de generación activa ────────────────────────────────────────
+
+    async def _is_generating(self) -> bool:
+        page = self._page
+        site = self.site
+        for sel in site["done_sel"].split(","):
+            sel = sel.strip()
+            if not sel: continue
+            try:
+                btn = await page.query_selector(sel)
+                if btn: return False
+            except Exception: continue
+        for sel in [
+            'button[aria-label="Stop"]', 'button[aria-label="Detener"]',
+            'button[aria-label="Stop generating"]', '[data-testid="stop-button"]',
+            '[class*="stop-button"]', '[class*="spinner"]',
+            '[class*="loading"]', '[class*="generating"]', '[class*="streaming"]',
+        ]:
+            try:
+                if await page.query_selector(sel): return True
+            except Exception: continue
+        return False
+
+    # ── Artefactos en iframes (Claude) ────────────────────────────────────────
+
+    async def _extract_from_artifacts(self) -> str:
+        page  = self._page
+        parts = []
+        try:
+            for frame in page.frames:
+                if frame == page.main_frame: continue
+                try:
+                    content = await frame.evaluate("""
+                        () => {
+                          const body = document.body;
+                          if (!body) return '';
+                          return body.innerText || body.textContent || '';
+                        }
+                    """)
+                    content = (content or "").strip()
+                    if content and len(content) > 30:
+                        parts.append(content)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return "\n\n".join(parts) if parts else ""
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  WAIT FOR RESPONSE — v10
+    #
+    #  CAMBIOS vs v9:
+    #  · Umbral de detección: len > 40  →  len > 3
+    #    Motivo: respuestas cortas como "ng new ..." (< 40 chars) nunca
+    #    superaban el umbral → no_text_count++ hasta timeout.
+    #  · no_text_count >= 12  →  >= 20
+    #    Más paciencia antes de rendirse cuando last_txt es vacío.
+    #  · Log de diagnóstico mejorado.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _wait_for_response(self, max_wait: int = 0,
+                                  prev_count: int = 0) -> str:
+        if max_wait == 0:
+            max_wait = 360 if self.site_key == "claude" else 180
+
+        start         = time.time()
+        last_txt      = ""
+        stable        = 0
+        no_text_count = 0
+        new_appeared  = False
+
+        await asyncio.sleep(3)
+
+        while time.time() - start < max_wait:
+            await asyncio.sleep(2)
+
+            try:
+                current = await self._extract_new_response(prev_count)
+            except Exception:
+                current = ""
+
+            # ── FIX 5e: Umbral bajado de > 40 a > 3 ─────────────────────────
+            # Antes: respuestas cortas (comandos de 1 línea) nunca superaban
+            # el umbral → se iban directo a no_text_count++ → timeout.
+            if current and len(current) > 3:
+                no_text_count = 0
+                if not new_appeared:
+                    new_appeared = True
+                    print(f"  {C.DIM}  Nueva respuesta detectada ({len(current)} chars)...{C.RESET}")
+
+                if current == last_txt:
+                    stable += 1
+                    if stable >= 3:
+                        if not await self._is_generating():
+                            if self.site_key == "claude":
+                                try:
+                                    artifact_text = await self._extract_from_artifacts()
+                                    if artifact_text and len(artifact_text) > 30:
+                                        current = current + "\n\n" + artifact_text
+                                        print(f"  {C.DIM}  📦 Artefacto iframe detectado ({len(artifact_text)} chars){C.RESET}")
+                                except Exception:
+                                    pass
+                            print(f"  {C.DIM}  Respuesta lista ({len(current)} chars){C.RESET}")
+                            return current
+                        stable = 0
+                else:
+                    stable   = 0
+                    last_txt = current
+            else:
+                no_text_count += 1
+                if no_text_count == 8:
+                    elapsed = int(time.time() - start)
+                    print(f"  {C.YELLOW}  ⚠️  Aún esperando nueva respuesta... ({elapsed}s){C.RESET}")
+                # ── FIX 5e: Paciencia aumentada de >= 12 a >= 20 ─────────────
+                # Más tiempo antes de devolver last_txt cuando es vacío.
+                if no_text_count >= 20 and last_txt:
+                    if not await self._is_generating():
+                        return last_txt
+
+        # ── Timeout ───────────────────────────────────────────────────────────
+        txt = last_txt
+        if txt:
+            if self.site_key == "claude" and await self._is_generating():
+                print(f"  {C.YELLOW}  ⚠️  Timeout ({max_wait}s) pero Claude sigue generando — "
+                      f"esperando hasta 120s más...{C.RESET}")
+                extra_waited = 0
+                while extra_waited < 120:
+                    await asyncio.sleep(5)
+                    extra_waited += 5
+                    try:
+                        new_txt = await self._extract_new_response(prev_count)
+                        if new_txt and len(new_txt) > len(txt):
+                            txt = new_txt
+                    except Exception:
+                        pass
+                    if not await self._is_generating():
+                        await asyncio.sleep(2)
+                        try:
+                            final_txt = await self._extract_new_response(prev_count)
+                            if final_txt and len(final_txt) > len(txt):
+                                txt = final_txt
+                        except Exception:
+                            pass
+                        try:
+                            artifact_text = await self._extract_from_artifacts()
+                            if artifact_text and len(artifact_text) > 30:
+                                txt = txt + "\n\n" + artifact_text
+                        except Exception:
+                            pass
+                        print(f"  {C.GREEN}  ✅ Generación completada tras espera extra "
+                              f"({extra_waited}s) — {len(txt)} chars{C.RESET}")
+                        return txt
+                print(f"  {C.YELLOW}  ⚠️  Espera extra agotada — devolviendo lo que hay "
+                      f"({len(txt)} chars){C.RESET}")
+            else:
+                print(f"  {C.YELLOW}  ⚠️  Timeout — devolviendo ({len(txt)} chars){C.RESET}")
+            return txt
+
+        return "No se pudo leer la respuesta."
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  ENVIAR TEXTO AL INPUT
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _send_via_clipboard(self, el, text: str):
+        pyperclip.copy(text)
+        await el.click()
+        await asyncio.sleep(0.3)
+        await el.evaluate("el => el.focus()")
+        mod = "Meta" if sys.platform == "darwin" else "Control"
+        await el.press(f"{mod}+a")
+        await asyncio.sleep(0.2)
+        await el.press(f"{mod}+v")
+        await asyncio.sleep(0.5)
+
+    async def _send_via_evaluate(self, el, text: str):
+        try:
+            await el.evaluate(f"""
+                (el) => {{
+                    el.focus();
+                    if (el.isContentEditable) {{
+                        el.innerText = {repr(text)};
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }} else {{
+                        const ns = Object.getOwnPropertyDescriptor(
+                                       window.HTMLTextAreaElement.prototype, 'value')?.set;
+                        if (ns) {{
+                            ns.call(el, {repr(text)});
+                            el.dispatchEvent(new Event('input',  {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }} else {{ el.value = {repr(text)}; }}
+                    }}
+                }})()
+            """)
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"  {C.RED}  _send_via_evaluate falló: {e}{C.RESET}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SEND PROMPT — método principal público
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def send_prompt(self, prompt: str) -> str:
+        site = self.site
+        page = self._page
+
+        site_host = re.sub(r"^https?://", "", site["url"]).split("/")[0].lower()
+        if site_host not in (page.url or "").lower():
+            await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+
+        if (self.site_key == "chatgpt"
+                and self._chatgpt_env_credentials_set()
+                and self._chatgpt_allow_automated_login()):
+            try:
+                if await self._chatgpt_has_login_button():
+                    await self.wait_for_login()
+                    await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+            except Exception: pass
+
+        try:
+            await page.wait_for_selector(site["input_sel"], timeout=15000)
+        except Exception as e:
+            if await self.needs_login(navigate_if_needed=False):
+                await self.wait_for_login()
+                await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+                await page.wait_for_selector(site["input_sel"], timeout=15000)
+            else:
+                print(f"  {C.RED}Error encontrando input: {e}{C.RESET}"); raise
+
+        prev_count = await self._count_responses()
+        print(f"    Respuestas previas en DOM: {prev_count}")
+
+        pyperclip.copy(prompt)
+        print(f"    Prompt copiado al portapapeles ({len(prompt)} chars)")
+
+        input_el = await _query_first(page, site["input_sel"])
+        if not input_el:
+            raise RuntimeError("No se encontró el elemento de input.")
+
+        await self._send_via_clipboard(input_el, prompt)
+
+        try:
+            val = await input_el.evaluate(
+                "el => el.isContentEditable ? el.innerText : el.value"
+            )
+            if not val or len(val.strip()) < len(prompt) * 0.5:
+                print(f"  {C.YELLOW}  ⚠️  Clipboard no funcionó, usando evaluate...{C.RESET}")
+                await self._send_via_evaluate(input_el, prompt)
+        except Exception:
+            pass
+
+        await asyncio.sleep(0.5)
+        send_el = await _query_first(page, site["send_sel"])
+        if send_el:
+            await send_el.click()
+        else:
+            mod = "Meta" if sys.platform == "darwin" else "Control"
+            await input_el.press("Enter")
+
+        print(f"    Esperando respuesta de {site['name']}...")
+        return await self._wait_for_response(prev_count=prev_count)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHUTDOWN
+# ══════════════════════════════════════════════════════════════════════════════
+
+_active_sessions: dict[str, BrowserSession] = {}
+
+def get_or_create_session(site_key: str) -> BrowserSession:
+    if site_key not in _active_sessions:
+        _active_sessions[site_key] = BrowserSession(site_key)
+    return _active_sessions[site_key]
+
+def shutdown_ai_scraper_runtime():
+    async def _close_all():
+        for sess in _active_sessions.values():
+            try:
+                await sess.close()
+            except Exception:
+                pass
+        _active_sessions.clear()
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_close_all())
+        else:
+            loop.run_until_complete(_close_all())
+    except Exception:
+        pass
+ai_scraper.y:
+"""Capa de comunicación LLM vía navegador para Sonny.
+
+Este módulo NO ejecuta acciones ni parsea pasos.
+Solo envía prompts al proveedor web y devuelve texto crudo.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from typing import Optional
+
+from core.browser import AI_SITES, BrowserSession, C, check_playwright, install_playwright
+from core.web_log import log_error, log_prompt, log_response
+
+SITE_PRIORITY = ["claude", "chatgpt", "gemini", "qwen"]
+_PERSISTENT_SESSIONS: dict[str, BrowserSession] = {}
+
+_RUNTIME_LOOP: asyncio.AbstractEventLoop | None = None
+_RUNTIME_THREAD: threading.Thread | None = None
+_RUNTIME_LOCK = threading.Lock()
+_PREFERRED_SITE: str | None = None
+
+
+def set_preferred_site(site_key: str | None) -> None:
+    """Define preferencia global de proveedor para call_llm()."""
+    global _PREFERRED_SITE
+    if site_key is None:
+        _PREFERRED_SITE = None
+        return
+    site = site_key.strip().lower()
+    _PREFERRED_SITE = site if site in AI_SITES else None
+
+
+def get_preferred_site() -> str | None:
+    return _PREFERRED_SITE
+
+
+def available_sites() -> list[str]:
+    return list(AI_SITES.keys())
+
+
+def _ensure_runtime_loop() -> asyncio.AbstractEventLoop:
+    global _RUNTIME_LOOP, _RUNTIME_THREAD
+    with _RUNTIME_LOCK:
+        if _RUNTIME_LOOP and _RUNTIME_LOOP.is_running():
+            return _RUNTIME_LOOP
+
+        _RUNTIME_LOOP = asyncio.new_event_loop()
+
+        def _runner(loop: asyncio.AbstractEventLoop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        _RUNTIME_THREAD = threading.Thread(target=_runner, args=(_RUNTIME_LOOP,), daemon=True)
+        _RUNTIME_THREAD.start()
+        return _RUNTIME_LOOP
+
+
+def shutdown_ai_scraper_runtime() -> None:
+    """Cierra runtime y sesiones persistentes de navegador."""
+    global _RUNTIME_LOOP, _RUNTIME_THREAD
+
+    async def _close_sessions():
+        for key, session in list(_PERSISTENT_SESSIONS.items()):
+            try:
+                await session.close()
+            except Exception:
+                pass
+            finally:
+                _PERSISTENT_SESSIONS.pop(key, None)
+
+    loop = _RUNTIME_LOOP
+    if loop and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(_close_sessions(), loop)
+        try:
+            future.result(timeout=8)
+        except Exception:
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+
+    _RUNTIME_LOOP = None
+    _RUNTIME_THREAD = None
+
+
+async def _call_llm_async(prompt: str, preferred_site: Optional[str] = None, objetivo: str = "") -> str:
+    if not check_playwright():
+        install_playwright()
+
+    sites = [preferred_site] if preferred_site in AI_SITES else SITE_PRIORITY
+
+    for site_key in sites:
+        site_name = AI_SITES[site_key]["name"]
+        try:
+            session = _PERSISTENT_SESSIONS.get(site_key)
+            if session is None:
+                session = BrowserSession(site_key)
+                _PERSISTENT_SESSIONS[site_key] = session
+                await session.start()
+
+            log_prompt(site_name, prompt, objetivo or prompt)
+            raw_response = await session.send_prompt(prompt)
+            response = (raw_response or "").strip()
+
+            if response:
+                log_response(site_name, response, 0)
+                return response
+
+            log_error(site_name, "Respuesta vacía del LLM")
+        except Exception as exc:
+            log_error(site_name, str(exc))
+            print(f"{C.YELLOW}⚠️ Falló {site_name}, intentando siguiente proveedor...{C.RESET}")
+            try:
+                broken = _PERSISTENT_SESSIONS.pop(site_key, None)
+                if broken:
+                    await broken.close()
+            except Exception:
+                pass
+
+    raise RuntimeError("Ninguna IA web devolvió una respuesta utilizable.")
+
+
+def call_llm(prompt: str) -> str:
+    """Envía un prompt y devuelve texto crudo del LLM."""
+    preferred = get_preferred_site()
+    loop = _ensure_runtime_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _call_llm_async(prompt, preferred_site=preferred, objetivo=prompt),
+        loop,
+    )
+    return future.result()
+
+
+# Compatibilidad retroactiva
+
+def ask_ai_multiturn(prompts: list[str], preferred_site: str = None, objetivo: str = "") -> tuple[str, list[str]]:
+    responses: list[str] = []
+    site_used = preferred_site or SITE_PRIORITY[0]
+    for prompt in prompts:
+        loop = _ensure_runtime_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            _call_llm_async(prompt, preferred_site=preferred_site, objetivo=objetivo or prompt), loop
+        )
+        responses.append(future.result())
+    return site_used, responses
+
+
+def ask_ai_web_multiturn(prompts, preferred_site=None, objetivo=""):
+    return ask_ai_multiturn(prompts, preferred_site, objetivo)
+
+
+def ask_ai_web_sync(objetivo, preferred_site=None, raw_prompt=None):
+    prompt = raw_prompt if raw_prompt else objetivo
+    response = call_llm(prompt)
+    return response, []
+orchestator.py:
+"""Orquestador determinístico de Sonny."""
+
+from __future__ import annotations
+
+from collections import deque
+from datetime import datetime
+import json
+import os
+import platform
+import re
+import subprocess
+from pathlib import Path
+
+from core.agent import ActionExecutor
+from core.loop_guard import LoopGuard, LoopGuardError
+from core.planner import PlannerError, get_master_plan, get_phase_actions
+from core.ai_scraper import available_sites, set_preferred_site
+from core.state_manager import AgentState
+from core.validator import ValidationError, validate_actions, validate_plan
+from core.web_log import log_error, log_validation_failed, log_action_blocked, log_loop_detected, log_phase_event
+
+
+class C:
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text or "")
+
+
+def _run_cmd_utf8(cmd: str, cwd: Path | None = None, timeout: int = 30) -> tuple[int, str]:
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    return proc.returncode, _strip_ansi(out).strip()
+
+
+def _parse_angular_cli_version(output: str) -> str:
+    txt = (output or "").strip()
+    if not txt:
+        return "unknown"
+
+    for line in txt.splitlines():
+        low = line.lower()
+        if "angular cli" in low and ":" in line:
+            return line.split(":", 1)[1].strip() or "unknown"
+
+    m = re.search(r"angular\s+cli\s*:?\s*v?(\d+(?:\.\d+){1,3})", txt, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    return "unknown"
+
+
+def detect_angular_cli_version() -> str:
+    attempts = ["ng version --no-interactive", "ng version", "ng v"]
+    saw_any_output = False
+    for cmd in attempts:
+        code, out = _run_cmd_utf8(cmd)
+        if out:
+            saw_any_output = True
+            parsed = _parse_angular_cli_version(out)
+            if parsed != "unknown":
+                return parsed
+        if code == 0 and out:
+            continue
+    return "unknown" if saw_any_output else "not_installed"
+
+
+def detect_node_npm_os() -> dict[str, str]:
+    _, node = _run_cmd_utf8("node -v")
+    _, npm = _run_cmd_utf8("npm -v")
+    return {
+        "node": (node or "unknown").splitlines()[0].strip(),
+        "npm": (npm or "unknown").splitlines()[0].strip(),
+        "os": platform.system() or "unknown",
+    }
+
+
+def _sort_phases(plan: dict) -> list[dict]:
+    phases = plan.get("phases", [])
+    by_name = {p["name"]: p for p in phases}
+    indegree = {p["name"]: 0 for p in phases}
+
+    for phase in phases:
+        for dep in phase.get("depends_on", []):
+            indegree[phase["name"]] += 1
+
+    q = deque([name for name, d in indegree.items() if d == 0])
+    ordered: list[dict] = []
+
+    while q:
+        name = q.popleft()
+        ordered.append(by_name[name])
+        for other in phases:
+            if name in other.get("depends_on", []):
+                indegree[other["name"]] -= 1
+                if indegree[other["name"]] == 0:
+                    q.append(other["name"])
+
+    if len(ordered) != len(phases):
+        raise ValidationError("No fue posible ordenar las fases por dependencias.")
+
+    return ordered
+
+
+def _slugify_request(text: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", (text or "task").strip().lower()).strip("_")
+    return cleaned[:48] or "task"
+
+
+def _is_angular_request(user_request: str) -> bool:
+    low = (user_request or "").lower()
+    tokens = ("angular", "ng ", "ngnew", "landing page", "landing")
+    return any(token in low for token in tokens)
+
+
+def _sanitize_project_name(seed: str) -> str:
+    base = re.sub(r"[^a-z0-9-]+", "-", (seed or "hospital-landing").lower()).strip("-")
+    if not base:
+        base = "hospital-landing"
+    if not re.match(r"^[a-z]", base):
+        base = f"app-{base}"
+    return base[:40].rstrip("-") or "hospital-landing"
+
+
+
+
+def _build_ng_new_command(project_name: str, fast_init: bool = True) -> str:
+    parts = [
+        "ng",
+        "new",
+        project_name,
+        "--routing",
+        "--style=scss",
+        "--skip-git",
+        "--defaults",
+        "--interactive=false",
+    ]
+    if fast_init:
+        parts.append("--skip-install")
+    return " ".join(parts)
+
+
+def _ensure_angular_project_initialized(task_workspace: Path, state: AgentState, user_request: str) -> Path | None:
+    existing_root = _find_angular_root(task_workspace)
+    if existing_root:
+        state.set_project_root(existing_root)
+        state.angular_project_version = _angular_project_version(existing_root)
+        state.set_current_workdir(existing_root)
+        return existing_root
+
+    if not _is_angular_request(user_request):
+        return None
+
+    if (state.angular_cli_version or "").strip() in {"unknown", "not_installed", ""}:
+        print(f"  {C.YELLOW}⚠️ Angular CLI no disponible; no se puede inicializar proyecto automáticamente.{C.RESET}")
+        return None
+
+    project_name = _sanitize_project_name(_slugify_request(user_request))
+    # Por defecto hacemos init rápido para no bloquear UX en npm install largo.
+    fast_init = os.getenv("SONNY_ANGULAR_FAST_INIT", "1").strip().lower() not in {"0", "false", "no"}
+    cmd = _build_ng_new_command(project_name, fast_init=fast_init)
+    print(f"  {C.CYAN}▶ Inicializando proyecto Angular base: {project_name}{C.RESET}")
+    if fast_init:
+        print(f"  {C.DIM}Init rápido activo (--skip-install). Puedes instalar deps luego con npm install.{C.RESET}")
+    code, out = _run_cmd_utf8(cmd, cwd=task_workspace, timeout=300 if fast_init else 900)
+    if code != 0:
+        raise RuntimeError(f"No se pudo inicializar proyecto Angular base con ng new: {out[-1000:]}")
+
+    project_root = (task_workspace / project_name).resolve()
+    state.set_project_root(project_root)
+    state.angular_project_version = _angular_project_version(project_root)
+    state.set_current_workdir(project_root)
+    return project_root
+
+
+def _build_task_workspace(user_request: str, workspace: Path | None) -> Path:
+    if workspace is not None:
+        root = Path(workspace)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    base = Path(__file__).parent.parent / "workspace"
+    base.mkdir(parents=True, exist_ok=True)
+    task_dir = base / f"{_slugify_request(user_request)}_{datetime.now().strftime('%H%M%S_%f')}"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return task_dir
+
+
+def _find_angular_root(task_workspace: Path) -> Path | None:
+    angular_files = list(task_workspace.rglob("angular.json"))
+    if not angular_files:
+        return None
+    angular_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return angular_files[0].parent.resolve()
+
+
+def _angular_project_version(project_root: Path | None) -> str:
+    if not project_root:
+        return "unknown"
+    package = project_root / "package.json"
+    if not package.exists():
+        return "unknown"
+    try:
+        data = json.loads(package.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return "unknown"
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+    return str(deps.get("@angular/core", "unknown"))
+
+
+def _snapshot_project_files(task_workspace: Path, project_root: Path | None) -> dict:
+    target = project_root or task_workspace
+    if not target.exists():
+        return {"existing": [], "missing": [], "structure": "unknown", "app_tree": []}
+
+    app_dir = target / "src" / "app"
+    app_tree: list[str] = []
+    if app_dir.exists():
+        app_tree = [str(p.relative_to(target)).replace("\\", "/") for p in sorted(app_dir.rglob("*")) if p.is_file()]
+
+    key_files = [
+        "src/app/app.ts",
+        "src/app/app.html",
+        "src/app/app.config.ts",
+        "src/app/app.routes.ts",
+        "src/styles.scss",
+        "src/app/app.component.ts",
+        "src/app/app.component.html",
+        "src/app/app.module.ts",
+        "src/environments/environment.prod.ts",
+    ]
+
+    existing, missing = [], []
+    for rel in key_files:
+        candidate = target / rel
+        if candidate.exists():
+            existing.append(rel)
+        else:
+            missing.append(rel)
+
+    structure = "standalone_components (NO NgModules)" if "src/app/app.config.ts" in existing else "ngmodules"
+    return {"existing": existing, "missing": missing, "structure": structure, "app_tree": app_tree}
+
+
+def _failed_action_summaries(state: AgentState) -> list[dict]:
+    failed = []
+    for entry in state.action_history[-20:]:
+        result = entry.get("result", {})
+        if result.get("ok") is False:
+            failed.append(
+                {
+                    "phase": entry.get("phase"),
+                    "type": entry.get("action", {}).get("type"),
+                    "error": result.get("error", "unknown"),
+                }
+            )
+    return failed[-6:]
+
+
+def _sync_state_before_phase(state: AgentState, task_workspace: Path) -> None:
+    if not state.current_workdir or not Path(state.current_workdir).exists():
+        state.set_current_workdir(task_workspace)
+
+    project = _find_angular_root(task_workspace)
+    if project:
+        state.set_project_root(project)
+        state.angular_project_version = _angular_project_version(project)
+
+
+def _project_has_lint_target(project_root: Path | None) -> bool:
+    if not project_root:
+        return False
+
+    angular_file = Path(project_root) / "angular.json"
+    if not angular_file.exists():
+        return False
+
+    try:
+        content = angular_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+
+    return '"lint"' in content
+
+
+def _phase_generates_code(actions_payload: dict) -> bool:
+    actions = actions_payload.get("actions", [])
+    for action in actions:
+        t = action.get("type")
+        if t in {"file_write", "file_modify"}:
+            return True
+        if t == "command":
+            cmd = (action.get("command") or "").lower()
+            if any(k in cmd for k in ("ng new", "ng g", "ng generate", "npm install", "ng add")):
+                return True
+    return False
+
+
+def _run_quality_checks(project_root: Path) -> tuple[list[dict], list[dict]]:
+    checks = [
+        ("ng build --configuration production", "Prueba de Compilación (AOT)", 300),
+        ("ng test --no-watch --browsers=ChromeHeadless", "Pruebas Unitarias", 300),
+        ("ng e2e", "Pruebas de Extremo a Extremo", 300),
+    ]
+    if _project_has_lint_target(project_root):
+        checks.insert(1, ("ng lint", "Análisis Estático", 120))
+
+    failures: list[dict] = []
+    reports: list[dict] = []
+
+    for cmd, check_type, timeout in checks:
+        code, out = _run_cmd_utf8(cmd, cwd=project_root, timeout=timeout)
+        report = {
+            "command": cmd,
+            "type": check_type,
+            "ok": code == 0,
+            "exit_code": code,
+            "output": out[-4000:],
+        }
+        reports.append(report)
+        if code != 0:
+            failures.append(report)
+
+    return failures, reports
+
+
+def _print_checklist(reports: list[dict], round_num: int) -> None:
+    print(f"  {C.CYAN}Checklist calidad (ronda {round_num}):{C.RESET}")
+    for item in reports:
+        icon = "✅" if item.get("ok") else "❌"
+        print(f"    {icon} {item['command']} [{item['type']}]")
+
+
+def _autofix_with_llm(
+    fix_context: dict,
+    executor: ActionExecutor,
+    state: AgentState,
+    preferred_site: str | None,
+) -> list[dict]:
+    actions_payload = get_phase_actions("Corrección automática de calidad", fix_context, preferred_site=preferred_site)
+    validate_actions(actions_payload)
+    return executor.execute_actions(actions_payload, state)
+
+
+
+
+def _version_major(version_text: str) -> int | None:
+    m = re.search(r"(\d+)", str(version_text or ""))
+    return int(m.group(1)) if m else None
+
+
+def _build_angular_rules(project_structure: str, project_version: str) -> list[str]:
+    rules = [
+        "Genera acciones válidas para la estructura detectada; no mezcles arquitecturas.",
+        "Usa rutas relativas y evita tocar archivos fuera del proyecto.",
+    ]
+
+    major = _version_major(project_version)
+    if project_structure == "ngmodules":
+        rules += [
+            "NO uses ni modifiques app.config.ts.",
+            "Usa app.module.ts como configuración central.",
+        ]
+    elif project_structure == "standalone_components (NO NgModules)":
+        rules += [
+            "Usa componentes standalone (NO NgModules).",
+            "app.config.ts es central y puede modificarse si es necesario.",
+            "No crees app.module.ts salvo que exista explícitamente en el árbol real.",
+        ]
+    else:
+        if major is not None and major >= 17:
+            rules += [
+                "Estructura unknown: asume standalone por Angular >= 17.",
+                "Prefiere app.ts/app.html/app.config.ts.",
+            ]
+        elif major is not None and major < 15:
+            rules += [
+                "Estructura unknown: asume NgModule por Angular < 15.",
+                "Prefiere app.module.ts y evita app.config.ts.",
+            ]
+        else:
+            rules += [
+                "Estructura unknown en Angular 15-16: NO asumas arquitectura.",
+                "Consulta el árbol real; si falta evidencia, crea con file_write sin reemplazar estructura base.",
+            ]
+
+    rules += [
+        "Usa ng build --configuration production (NO --prod).",
+        "Ejecuta ng lint solo si angular.json define el target lint.",
+        "Ejecuta ng e2e solo si angular.json define un target e2e.",
+    ]
+    return rules
+
+def _validate_action_consistency(actions_payload: dict, context: dict) -> None:
+    structure = context.get("project_structure", "unknown")
+    existing = set(context.get("existing_files", []) or [])
+
+    for action in actions_payload.get("actions", []):
+        if action.get("type") not in {"file_write", "file_modify"}:
+            continue
+        path = str(action.get("path", "")).replace("\\", "/")
+        if structure == "standalone_components (NO NgModules)" and path.endswith("src/app/app.module.ts") and "src/app/app.module.ts" not in existing:
+            raise ValidationError(
+                "Acción inválida para standalone: no crees app.module.ts si no existe en el árbol real."
+            )
+
+
+def run_orchestrator(
+    user_request: str,
+    workspace: Path | None = None,
+    preferred_site: str | None = None,
+    angular_cli_version_hint: str | None = None,
+) -> dict:
+    task_workspace = _build_task_workspace(user_request, workspace)
+    state = AgentState()
+    state.set_task_workspace(task_workspace)
+    state.angular_cli_version = angular_cli_version_hint or detect_angular_cli_version()
+    runtime_env = detect_node_npm_os()
+
+    executor = ActionExecutor(workspace=task_workspace)
+    print(f"  {C.DIM}Workspace de tarea: {task_workspace}{C.RESET}")
+    print(f"  {C.DIM}Angular CLI global: {state.angular_cli_version}{C.RESET}")
+
+    _ensure_angular_project_initialized(task_workspace, state, user_request)
+
+    master_plan: dict | None = None
+    for _ in range(2):
+        master_plan = get_master_plan(user_request, preferred_site=preferred_site)
+        try:
+            validate_plan(master_plan)
+            break
+        except ValidationError as exc:
+            log_validation_failed("plan", str(exc))
+            user_request = f"Corrige estructuralmente el plan previo. Error: {exc}. Solicitud original: {user_request}"
+    else:
+        raise PlannerError("No se pudo obtener un plan maestro estructuralmente válido.")
+
+    phase_results: list[dict] = []
+    ordered_phases = _sort_phases(master_plan)
+    print(f"  {C.CYAN}Plan validado: {len(ordered_phases)} fase(s){C.RESET}")
+
+    for phase in ordered_phases:
+        phase_name = phase["name"]
+        state.set_phase(phase_name)
+        _sync_state_before_phase(state, task_workspace)
+
+        snap = _snapshot_project_files(task_workspace, state.project_root)
+        context = {
+            "user_request": user_request,
+            "phase": phase,
+            "completed_phases": state.completed_phases,
+            "action_history": state.action_history[-10:],
+            "failed_actions": _failed_action_summaries(state),
+            "errores_compilacion": [],
+            "task_workspace": str(state.task_workspace) if state.task_workspace else "",
+            "current_workdir": str(state.current_workdir) if state.current_workdir else "",
+            "project_root": str(state.project_root) if state.project_root else "",
+            "angular_cli_version": state.angular_cli_version,
+            "angular_project_version": state.angular_project_version,
+            "runtime_env": runtime_env,
+            "project_structure": snap["structure"],
+            "existing_files": snap["existing"],
+            "missing_files": snap["missing"],
+            "app_tree": snap["app_tree"],
+            "valid_commands": [
+                "ng build --configuration production (NO --prod)",
+                "ng test --no-watch --browsers=ChromeHeadless",
+                *(["ng lint (requiere angular-eslint)"] if _project_has_lint_target(state.project_root) else []),
+                "ng e2e",
+            ],
+            "deprecated_commands": ["ng build --prod"],
+            "angular_rules": _build_angular_rules(snap["structure"], state.angular_project_version),
+        }
+
+        try:
+            actions_payload = get_phase_actions(phase_name, context, preferred_site=preferred_site)
+            validate_actions(actions_payload)
+            _validate_action_consistency(actions_payload, context)
+        except ValidationError as exc:
+            log_validation_failed(f"acciones:{phase_name}", str(exc))
+            log_action_blocked("phase_actions", str(exc))
+            raise
+
+        log_phase_event(phase_name, "start")
+        actions = actions_payload.get("actions", [])
+        print(f"  {C.CYAN}▶ Fase: {phase_name}{C.RESET} {C.DIM}({len(actions)} acciones){C.RESET}")
+        for idx, action in enumerate(actions, 1):
+            atype = action.get("type", "unknown")
+            detail = action.get("path") or action.get("command") or action.get("prompt", "")[:60]
+            print(f"    {C.DIM}- [{idx}/{len(actions)}] {atype}: {detail}{C.RESET}")
+
+        try:
+            results = executor.execute_actions(actions_payload, state)
+            _sync_state_before_phase(state, task_workspace)
+            state.increment_iteration()
+            LoopGuard.check(state)
+            state.complete_phase(phase_name)
+            state.reset_phase()
+            phase_results.append(
+                {
+                    "phase": phase_name,
+                    "results": results,
+                    "cwd": str(state.current_workdir or task_workspace),
+                    "project_root": str(state.project_root) if state.project_root else "",
+                }
+            )
+            log_phase_event(phase_name, "completed", f"actions={len(results)}")
+        except LoopGuardError as exc:
+            log_loop_detected(phase_name, str(exc))
+            raise LoopGuardError(f"{exc} | fase={phase_name} | iteraciones={state.iteration_count}")
+        except Exception as exc:
+            log_error("orchestrator", f"Error en fase '{phase_name}': {exc}")
+            raise
+
+        # Validación post-fase con auto-corrección (máx 3 intentos)
+        if state.project_root and _phase_generates_code(actions_payload):
+            print(f"  {C.CYAN}▶ Verificando calidad tras fase: {phase_name}{C.RESET}")
+            max_fix_rounds = 3
+            accumulated_quality_failures: list[dict] = []
+            for round_num in range(1, max_fix_rounds + 1):
+                failures, reports = _run_quality_checks(Path(state.project_root))
+                accumulated_quality_failures.extend(failures)
+                _print_checklist(reports, round_num)
+
+                phase_results.append(
+                    {
+                        "phase": f"quality_checks_{phase_name}_round_{round_num}",
+                        "results": reports,
+                        "cwd": str(state.project_root),
+                        "project_root": str(state.project_root),
+                    }
+                )
+
+                if not failures:
+                    print(f"  {C.GREEN}✅ Fase '{phase_name}' verificada y compilable.{C.RESET}")
+                    break
+
+                if round_num == max_fix_rounds:
+                    print(f"  {C.RED}❌ Fase '{phase_name}' no se pudo estabilizar tras {max_fix_rounds} intentos.{C.RESET}")
+                    break
+
+                print(f"  {C.YELLOW}⚠️ Corrigiendo errores detectados ({len(failures)}) con LLM...{C.RESET}")
+                blocked_quality_commands = list(dict.fromkeys([
+                    str(f.get("command", "")).strip()
+                    for f in accumulated_quality_failures
+                    if f.get("exit_code") != 0 and str(f.get("command", "")).strip()
+                ]))
+                forbidden_commands = [
+                    "ng serve",
+                    "npm start",
+                    "npm run start",
+                    *blocked_quality_commands,
+                ]
+                filtered_valid_commands = []
+                for cmd in list(context.get("valid_commands", []) or []):
+                    normalized = str(cmd).strip()
+                    is_blocked = any(
+                        normalized == blocked
+                        or normalized.startswith(f"{blocked} ")
+                        or blocked.startswith(f"{normalized} ")
+                        for blocked in forbidden_commands
+                    )
+                    if not is_blocked:
+                        filtered_valid_commands.append(cmd)
+
+                fix_context = {
+                    **context,
+                    "phase": {
+                        "name": f"Corrección automática ({phase_name})",
+                        "description": "Corrige errores de build/lint/test/e2e sin usar comandos interactivos.",
+                        "depends_on": [phase_name],
+                    },
+                    "failed_checks": failures,
+                    "accumulated_quality_failures": accumulated_quality_failures[-20:],
+                    "errores_compilacion": failures,
+                    "forbidden_commands": forbidden_commands,
+                    "valid_commands": filtered_valid_commands,
+                    "action_history": state.action_history[-20:],
+                    "failed_actions": _failed_action_summaries(state),
+                }
+
+                try:
+                    fix_results = _autofix_with_llm(fix_context, executor, state, preferred_site)
+                    phase_results.append(
+                        {
+                            "phase": f"quality_autofix_{phase_name}_round_{round_num}",
+                            "results": fix_results,
+                            "cwd": str(state.current_workdir or state.project_root),
+                            "project_root": str(state.project_root) if state.project_root else "",
+                        }
+                    )
+                except Exception as exc:
+                    log_error("orchestrator", f"Auto-fix de calidad falló en fase '{phase_name}': {exc}")
+                    break
+
+    print(f"  {C.GREEN}✅ Orquestación finalizada.{C.RESET}")
+    return {
+        "ok": True,
+        "plan": master_plan,
+        "completed_phases": state.completed_phases,
+        "iterations": state.iteration_count,
+        "phase_results": phase_results,
+        "task_workspace": str(task_workspace),
+        "project_root": str(state.project_root) if state.project_root else "",
+        "angular_cli_version": state.angular_cli_version,
+        "angular_project_version": state.angular_project_version,
+        "runtime_env": runtime_env,
+    }
+
+
+def detectar_navegadores():
+    return []
+
+
+def _extract_site_from_request(user_request: str) -> str | None:
+    low = (user_request or "").lower()
+    aliases = {
+        "claude": "claude",
+        "chatgpt": "chatgpt",
+        "chat gpt": "chatgpt",
+        "gpt": "chatgpt",
+        "gemini": "gemini",
+        "qwen": "qwen",
+    }
+    for token, key in aliases.items():
+        if token in low:
+            return key
+    return None
+
+
+def run_orchestrator_with_site(
+    user_request: str,
+    preferred_site: str | None = None,
+    angular_cli_version_hint: str | None = None,
+):
+    selected = preferred_site or _extract_site_from_request(user_request)
+    if selected and selected in available_sites():
+        set_preferred_site(selected)
+    else:
+        selected = None
+        set_preferred_site(None)
+    return run_orchestrator(user_request, preferred_site=selected, angular_cli_version_hint=angular_cli_version_hint)

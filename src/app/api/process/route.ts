@@ -1,0 +1,1635 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+import fs from 'fs/promises';
+import os from 'os';
+
+const execAsync = promisify(exec);
+
+// ═══════════════════════════════════════════════════════════════
+// DETECCIÓN DE ENTORNO
+// ═══════════════════════════════════════════════════════════════
+
+const isWindows = os.platform() === 'win32';
+
+// Verificar si un comando es específico de PowerShell (cmdlets)
+function isPowerShellCmdlet(cmd: string): boolean {
+  const psPatterns = [
+    /^Set-Location/i, /^Get-/i, /^New-Item/i, /^Remove-Item/i,
+    /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
+    /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
+    /^Test-Connection/i, /^Start-/i, /^Stop-/i,
+    /^\(\s*Get-/i,  // (Get-... expresiones
+  ];
+  return psPatterns.some(p => p.test(cmd.trim()));
+}
+
+// Limpiar comando - eliminar símbolos de prompt que no son parte del comando
+function cleanCommand(cmd: string): string {
+  let cleaned = cmd.trim();
+  
+  // Eliminar $ al inicio (prompt de Linux/Mac bash)
+  if (cleaned.startsWith('$ ') || cleaned.startsWith('$\t')) {
+    cleaned = cleaned.substring(1).trim();
+  }
+  
+  // Eliminar # al inicio (prompt de root)
+  if (cleaned.startsWith('# ') || cleaned.startsWith('#\t')) {
+    cleaned = cleaned.substring(1).trim();
+  }
+  
+  // Eliminar > al inicio (prompt de cmd)
+  if (cleaned.startsWith('> ') || cleaned.startsWith('>\t')) {
+    cleaned = cleaned.substring(1).trim();
+  }
+  
+  // Eliminar prompts de PowerShell como "PS C:\ruta> "
+  cleaned = cleaned.replace(/^PS\s+[A-Za-z]?:?[^>]*>\s*/i, '');
+  
+  // Eliminar prompts de MINGW64/Git Bash
+  cleaned = cleaned.replace(/^[^\s]+@[^\s]+\s+[A-Za-z0-9]+\s+[^\s]+\s*\$\s*/, '');
+  
+  return cleaned.trim();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EJECUCIÓN DE COMANDOS - SIMPLE Y DIRECTO
+// ═══════════════════════════════════════════════════════════════
+
+// Ejecutar comando directamente (como en el script que funciona)
+async function runCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  try {
+    // Usar execAsync exactamente como en el script que funciona
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd,
+      timeout: 300000,
+    });
+    return { stdout, stderr, code: 0 };
+  } catch (error: unknown) {
+    const execError = error as { stdout?: string; stderr?: string; code?: number };
+    return { 
+      stdout: execError.stdout || '', 
+      stderr: execError.stderr || '', 
+      code: execError.code || 1 
+    };
+  }
+}
+
+// Ejecutar comando PowerShell (para cmdlets específicos)
+async function runPowerShellCommand(cmd: string, cwd: string): Promise<{ stdout: string; stderr: string; code: number }> {
+  // Para cmdlets de PowerShell, envolver en powershell -Command
+  const psCmd = `powershell -Command "${cmd.replace(/"/g, '\\"')}"`;
+  return runCommand(psCmd, cwd);
+}
+
+/**
+ * Main Processing API - Flujo de Sonny v2.1
+ * 
+ * FLUJO DE FASES:
+ * 1A - Análisis de requisitos previos
+ * 1B - Instalación y configuración de requisitos
+ * 2  - Scaffolding y estructura del proyecto
+ * 3  - Desarrollo por bloques
+ * 4  - Validación y pruebas
+ * 
+ * IMPORTANTE: El servidor detecta su propio entorno y genera comandos
+ * para ESE entorno. Los comandos se ejecutan donde corre el backend.
+ */
+
+// ═══════════════════════════════════════════════════════════════
+// TIPOS
+// ═══════════════════════════════════════════════════════════════
+
+interface SystemInfo {
+  os_nombre: string;
+  os_version: string;
+  arquitectura: string;
+  shell_disponible: string;
+  gestor_paquetes: string;
+  ram_gb: number;
+  espacio_disco_gb: number;
+  conexion_internet: boolean;
+  disco_seleccionado: string;
+  directorio_trabajo: string;
+}
+
+interface Requisito {
+  nombre: string;
+  tipo: 'software' | 'hardware' | 'archivo' | 'credencial' | 'herramienta_fisica' | 'conocimiento' | 'otro';
+  obligatorio: boolean;
+  instalar_automaticamente: boolean;
+  version_minima: string | number | null;
+  version_recomendada: string | number | null;
+  comparador: '>=' | '>' | '==' | null;
+  comparador_error: '<' | '<=' | null;
+  unidad: 'GB' | 'MB' | null;
+  comando_verificacion: string | null;
+  salida_esperada: string | number | null;
+  salida_error: number | null;
+  accion_si_falta: 'instalar' | 'actualizar' | 'configurar' | 'adquirir' | 'liberar' | 'ignorar';
+  comando_instalacion: string | null;
+}
+
+interface Decision {
+  decision: string;
+  valor: string;
+  justificacion: string;
+  alternativas_descartadas: Array<{ nombre: string; razon: string }>;
+}
+
+interface ExecutionStep {
+  id: string;
+  fase: string;
+  paso: string;
+  accion: 'verificar' | 'instalar' | 'configurar' | 'crear' | 'editar' | 'eliminar' | 'validar' | 'corregir' | 'ejecutar' | 'scaffolding' | 'desarrollo_bloque';
+  descripcion: string;
+  status: 'pending' | 'running' | 'success' | 'error';
+  comandos?: string[];
+  archivos?: Array<{ nombre: string; contenido?: string; ruta?: string }>;
+  validacion?: string;
+  progreso?: string;
+  output?: string;
+  requisito_origen?: string;
+  tipo?: string;
+}
+
+interface ErrorReport {
+  fase: string;
+  paso: string;
+  accion_ejecutada: string;
+  tipo_error: 'instalacion' | 'configuracion' | 'codigo' | 'comando' | 'compatibilidad' | 'permisos' | 'red' | 'otro';
+  mensaje_error: string;
+  codigo_salida: number | null;
+  archivo_afectado: string | null;
+  linea_error: number | null;
+  contexto_archivo: string | null;
+  estructura_proyecto: Record<string, unknown>;
+  archivos_afectados: string[];
+  intentos_previos: Array<{ comando_intentado: string; resultado: string }>;
+  entorno_adicional: {
+    version_runtime: string | null;
+    version_gestor: string | null;
+  };
+}
+
+interface Phase1AResponse {
+  objetivo: string;
+  fase: string;
+  accion: string;
+  tipo_tarea: 'digital' | 'fisico' | 'mixto';
+  entorno_detectado: Record<string, string>;
+  decisiones_tomadas: Decision[];
+  descripcion: string;
+  requisitos: Requisito[];
+  compatibilidades: Array<Record<string, unknown>>;
+  alertas_entorno: Array<{ tipo: string; mensaje: string; critico: boolean }>;
+  archivos_necesarios: Array<unknown>;
+  credenciales_necesarias: Array<unknown>;
+  validacion_final: { comando: string | null; salida_esperada: string | null; salida_error: string | null };
+  progreso: string;
+  siguiente_fase: string;
+}
+
+interface Phase2Response {
+  fase: string;
+  accion: string;
+  tipo_scaffold: 'cli' | 'manual';
+  descripcion: string;
+  nombre_proyecto: string;
+  ruta_proyecto: string;
+  estructura_esperada: Record<string, unknown>;
+  pasos: Array<{
+    orden: number;
+    descripcion: string;
+    tipo: 'comando' | 'archivo';
+    comando: string | null;
+    archivo: { ruta: string; operacion: string; contenido: string | null } | null;
+    continuar_si_falla: boolean;
+  }>;
+  validacion: { comando: string; salida_esperada: string; salida_error: string; comparador: string };
+  progreso: string;
+  siguiente_fase: string;
+}
+
+interface Phase3Response {
+  fase: string;
+  accion: string;
+  bloque_actual: { id: string; nombre: string; descripcion: string; dependencias_bloque: string[] };
+  dependencias_adicionales: Array<{ nombre: string; comando_instalacion: string; razon: string }>;
+  archivos: Array<{ ruta: string; operacion: string; descripcion: string; contenido: string }>;
+  comandos_post_escritura: Array<{ orden: number; descripcion: string; comando: string; continuar_si_falla: boolean }>;
+  previsualizacion: { comando: string; url: string | null; instruccion: string };
+  validacion: { comando: string; salida_esperada: string; salida_error: string; comparador: string };
+  bloques_pendientes: Array<{ id: string; nombre: string; depende_de: string[] }>;
+  progreso: string;
+  siguiente_bloque: string | null;
+  siguiente_fase: string | null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ESTADO GLOBAL DE LA SESIÓN
+// ═══════════════════════════════════════════════════════════════
+
+interface SessionState {
+  currentWorkDir: string;
+  projectPath: string | null;
+  phase1AResult: Phase1AResponse | null;
+  phase2Result: Phase2Response | null;
+  completedBlocks: string[];
+  currentBlock: string | null;
+  pendingBlocks: string[];
+  errores: Array<{ fase: string; paso: string; error: string }>;
+}
+
+const sessionState: SessionState = {
+  currentWorkDir: process.cwd(),
+  projectPath: null,
+  phase1AResult: null,
+  phase2Result: null,
+  completedBlocks: [],
+  currentBlock: null,
+  pendingBlocks: [],
+  errores: [],
+};
+
+// ═══════════════════════════════════════════════════════════════
+// DETECCIÓN DE ENTORNO DEL SERVIDOR
+// ═══════════════════════════════════════════════════════════════
+
+// Función auxiliar para ejecutar comandos de detección de forma segura
+async function safeExecForDetection(cmd: string): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const result = await runCommand(cmd, process.cwd());
+    return { stdout: result.stdout, stderr: result.stderr };
+  } catch {
+    return { stdout: '', stderr: '' };
+  }
+}
+
+async function detectServerEnvironment(): Promise<SystemInfo> {
+  const platform = os.platform();
+  const release = os.release();
+  const arch = os.arch();
+  const totalRam = os.totalmem();
+  const ramGb = Math.round(totalRam / (1024 * 1024 * 1024));
+  
+  // Determinar nombre del OS
+  let osNombre = 'Linux';
+  let osVersion = release;
+  let shellDisponible = 'bash';
+  let gestorPaquetes = 'apt';
+  
+  if (platform === 'win32') {
+    osNombre = 'Windows';
+    shellDisponible = 'PowerShell';
+    gestorPaquetes = 'winget';
+    // Verificar chocolatey
+    try {
+      const { stdout } = await safeExecForDetection('choco --version');
+      if (stdout.trim()) gestorPaquetes = 'chocolatey';
+    } catch { /* winget es default */ }
+  } else if (platform === 'darwin') {
+    osNombre = 'macOS';
+    shellDisponible = 'zsh';
+    gestorPaquetes = 'brew';
+  } else {
+    // Linux - verificar qué gestor está disponible
+    const managers = [
+      { cmd: 'apt-get', name: 'apt' },
+      { cmd: 'dnf', name: 'dnf' },
+      { cmd: 'yum', name: 'yum' },
+      { cmd: 'pacman', name: 'pacman' },
+    ];
+    
+    for (const m of managers) {
+      try {
+        const { stdout } = await execAsync(`which ${m.cmd}`, { timeout: 2000 });
+        if (stdout.trim()) {
+          gestorPaquetes = m.name;
+          break;
+        }
+      } catch { /* continuar */ }
+    }
+    
+    // Detectar shell
+    const shell = process.env.SHELL || '/bin/bash';
+    if (shell.includes('zsh')) shellDisponible = 'zsh';
+    else if (shell.includes('fish')) shellDisponible = 'fish';
+  }
+  
+  // Espacio en disco
+  let espacioDisco = 50;
+  try {
+    if (platform === 'win32') {
+      // Usar PowerShell para obtener espacio en disco
+      const result = await runPowerShellCommand('(Get-PSDrive -Name C).Free / 1GB', process.cwd());
+      const valor = parseFloat(result.stdout.trim());
+      if (!isNaN(valor)) espacioDisco = Math.round(valor);
+    } else {
+      const { stdout } = await execAsync('df -BG / | tail -1', { timeout: 5000 });
+      const match = stdout.match(/(\d+)G\s+\d+%.*$/);
+      if (match) espacioDisco = parseInt(match[1]);
+    }
+  } catch { /* usar default */ }
+  
+  // Conexión a internet
+  let conexionInternet = false;
+  try {
+    if (platform === 'win32') {
+      // Usar ping normal (más simple)
+      const result = await runCommand('ping -n 1 google.com', process.cwd());
+      conexionInternet = result.code === 0;
+    } else {
+      await execAsync('ping -c 1 google.com', { timeout: 5000 });
+      conexionInternet = true;
+    }
+  } catch { /* sin conexión */ }
+  
+  return {
+    os_nombre: osNombre,
+    os_version: osVersion,
+    arquitectura: arch === 'x64' ? 'x86_64' : arch,
+    shell_disponible: shellDisponible,
+    gestor_paquetes: gestorPaquetes,
+    ram_gb: ramGb,
+    espacio_disco_gb: espacioDisco,
+    conexion_internet: conexionInternet,
+    disco_seleccionado: platform === 'win32' ? 'C' : '/',
+    directorio_trabajo: sessionState.currentWorkDir,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EJECUCIÓN DE COMANDOS
+// ═══════════════════════════════════════════════════════════════
+
+async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ success: boolean; output: string; exitCode: number }> {
+  // ═══════════════════════════════════════════════════════════════
+  // LIMPIAR COMANDO - Eliminar símbolos de prompt
+  // Los prompts como $, #, >, PS C:\> NO son parte del comando
+  // ═══════════════════════════════════════════════════════════════
+  const cleanedCmd = cleanCommand(cmd);
+  
+  console.log(`[executeCommand] Ejecutando: ${cleanedCmd}`);
+  console.log(`[executeCommand] Shell: ${systemInfo.shell_disponible}`);
+  console.log(`[executeCommand] Directorio de trabajo: ${sessionState.currentWorkDir}`);
+  
+  try {
+    // ═══════════════════════════════════════════════════════════════
+    // INTERCEPTAR COMANDOS DE CAMBIO DE DIRECTORIO
+    // Estos comandos no funcionan entre llamadas porque cada llamada
+    // es un proceso independiente
+    // ═══════════════════════════════════════════════════════════════
+    
+    // Patrones de cambio de directorio para diferentes shells
+    const cdPatterns = [
+      /^cd\s+(.+)$/i,                                    // bash/cmd: cd ruta
+      /^Set-Location\s+["']?(.+?)["']?\s*$/i,           // PowerShell: Set-Location "ruta"
+      /^sl\s+["']?(.+?)["']?\s*$/i,                     // PowerShell alias: sl ruta
+      /^pushd\s+(.+)$/i,                                // pushd ruta
+    ];
+    
+    for (const pattern of cdPatterns) {
+      const match = cleanedCmd.match(pattern);
+      if (match) {
+        let targetDir = match[1].trim().replace(/^["']|["']$/g, '');
+        
+        // Manejar rutas relativas
+        const newDir = path.isAbsolute(targetDir) 
+          ? targetDir 
+          : path.join(sessionState.currentWorkDir, targetDir);
+        
+        try {
+          await fs.access(newDir);
+          sessionState.currentWorkDir = newDir;
+          console.log(`[executeCommand] ✅ Directorio cambiado a: ${sessionState.currentWorkDir}`);
+          return { 
+            success: true, 
+            output: `Directorio cambiado a: ${sessionState.currentWorkDir}`, 
+            exitCode: 0 
+          };
+        } catch {
+          console.log(`[executeCommand] ❌ Directorio no encontrado: ${newDir}`);
+          return { 
+            success: false, 
+            output: `Directorio no encontrado: ${newDir}`, 
+            exitCode: 1 
+          };
+        }
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // INTERCEPTAR COMANDOS DE CREACIÓN DE DIRECTORIOS (PowerShell)
+    // New-Item -ItemType Directory -Path "ruta" -Force
+    // ═══════════════════════════════════════════════════════════════
+    
+    const mkdirMatch = cleanedCmd.match(/New-Item\s+-ItemType\s+Directory\s+-Path\s+["']?([^"'\s]+)["']?/i);
+    if (mkdirMatch) {
+      const targetPath = mkdirMatch[1];
+      const fullPath = path.isAbsolute(targetPath) 
+        ? targetPath 
+        : path.join(sessionState.currentWorkDir, targetPath);
+      
+      try {
+        await fs.mkdir(fullPath, { recursive: true });
+        console.log(`[executeCommand] ✅ Directorio creado: ${fullPath}`);
+        return { 
+          success: true, 
+          output: `Directorio creado: ${fullPath}`, 
+          exitCode: 0 
+        };
+      } catch (err) {
+        console.log(`[executeCommand] ❌ Error creando directorio: ${err}`);
+        return { 
+          success: false, 
+          output: `Error creando directorio: ${err}`, 
+          exitCode: 1 
+        };
+      }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // EJECUTAR COMANDO
+    // Usar execAsync directamente como en el script que funciona
+    // ═══════════════════════════════════════════════════════════════
+    
+    let result;
+    
+    // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
+    if (isWindows && isPowerShellCmdlet(cleanedCmd)) {
+      console.log('[executeCommand] Estrategia: PowerShell cmdlet');
+      result = await runPowerShellCommand(cleanedCmd, sessionState.currentWorkDir);
+    } else {
+      console.log('[executeCommand] Estrategia: Comando directo');
+      result = await runCommand(cleanedCmd, sessionState.currentWorkDir);
+    }
+    
+    const output = (result.stdout || '') + (result.stderr || '');
+    
+    if (result.code === 0) {
+      console.log(`[executeCommand] ✅ Output (${output.length} chars)`);
+      return { success: true, output: output || 'Comando ejecutado correctamente', exitCode: 0 };
+    } else {
+      console.log(`[executeCommand] ❌ Error (code ${result.code}):`, output.substring(0, 500));
+      return { success: false, output, exitCode: result.code };
+    }
+  } catch (error: unknown) {
+    const execError = error as { message?: string; code?: number };
+    const output = execError.message || 'Error desconocido';
+    const exitCode = execError.code || 1;
+    console.log(`[executeCommand] ❌ Excepción (code ${exitCode}):`, output.substring(0, 500));
+    return { success: false, output, exitCode };
+  }
+}
+
+async function createFile(nombre: string, contenido: string): Promise<{ success: boolean; message: string }> {
+  console.log(`[createFile] Creando: ${nombre}`);
+  
+  try {
+    const filePath = path.isAbsolute(nombre) ? nombre : path.join(sessionState.currentWorkDir, nombre);
+    const dir = path.dirname(filePath);
+    
+    // Crear directorios si no existen
+    await fs.mkdir(dir, { recursive: true });
+    
+    // Escribir archivo
+    await fs.writeFile(filePath, contenido, 'utf-8');
+    
+    console.log(`[createFile] ✅ Archivo creado: ${filePath}`);
+    return { success: true, message: `Archivo creado: ${filePath}` };
+  } catch (error) {
+    return { success: false, message: `Error creando archivo: ${error}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PROVEEDORES DE IA (Groq)
+// ═══════════════════════════════════════════════════════════════
+
+interface Provider {
+  name: string;
+  apiKey: string;
+  url: string;
+  model: string;
+}
+
+async function callGroqProvider(
+  provider: Provider,
+  systemPrompt: string,
+  userMessage: string,
+  maxTokens: number = 500
+): Promise<{ success: boolean; content?: string; error?: string }> {
+  try {
+    if (!provider.apiKey) {
+      return { success: false, error: 'API Key no configurada' };
+    }
+
+    const response = await fetch(provider.url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${provider.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
+        ],
+        temperature: 0.1,
+        max_tokens: maxTokens,
+      }),
+    });
+
+    if (!response.ok) {
+      return { success: false, error: `Error ${response.status}` };
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+    
+    return { success: true, content };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+async function tryGroqProviders(
+  groqApiKey: string,
+  systemPrompt: string,
+  userMessage: string,
+  maxTokens: number = 500
+): Promise<{ success: boolean; content?: string; provider?: string; error?: string }> {
+  const providers: Provider[] = [
+    { name: 'Groq-70B', apiKey: groqApiKey, url: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.3-70b-versatile' },
+    { name: 'Groq-8B', apiKey: groqApiKey, url: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.1-8b-instant' },
+  ];
+
+  for (const provider of providers) {
+    if (!provider.apiKey) continue;
+    
+    const result = await callGroqProvider(provider, systemPrompt, userMessage, maxTokens);
+
+    if (result.success && result.content) {
+      return { success: true, content: result.content, provider: provider.name };
+    }
+  }
+
+  return { success: false, error: 'Todos los proveedores fallaron' };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PARSING DE JSON
+// ═══════════════════════════════════════════════════════════════
+
+function parseJSONResponse<T>(response: string): T | null {
+  try {
+    return JSON.parse(response) as T;
+  } catch {
+    // Buscar JSON en la respuesta
+    const patterns = [
+      /\{[\s\S]*\}/,
+      /```json\s*([\s\S]*?)```/,
+      /```\s*([\s\S]*?)```/,
+    ];
+    
+    for (const pattern of patterns) {
+      const match = response.match(pattern);
+      if (match) {
+        try {
+          let clean = match[0].replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+          return JSON.parse(clean) as T;
+        } catch { continue; }
+      }
+    }
+  }
+  return null;
+}
+
+function parseInterpretation(response: string): { tipo: string; descripcion: string; necesita_ia_web: boolean } | null {
+  try {
+    const jsonMatch = response.match(/\{[\s\S]*?\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+  } catch { /* ignorar */ }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PROMPTS POR FASE
+// ═══════════════════════════════════════════════════════════════
+
+const INTERPRET_PROMPT = `Eres un intérprete MÍNIMO. Solo detecta la intención.
+
+Responde SOLO con JSON:
+- Desarrollo: {"tipo":"desarrollo","descripcion":"<qué>","necesita_ia_web":true}
+- Pregunta: {"tipo":"pregunta","descripcion":"<qué>","necesita_ia_web":false}
+- Comando: {"tipo":"comando","comando":"<cmd>","necesita_ia_web":false}
+- Desconocido: {"tipo":"desconocido","descripcion":"<qué>","necesita_ia_web":true}`;
+
+function buildPhase1APrompt(systemInfo: SystemInfo, userObjective: string): string {
+  return `Eres un analizador de requisitos previos para cualquier tipo de tarea u objetivo.
+Tu función es determinar qué se necesita ANTES de comenzar, verificar disponibilidad
+y garantizar compatibilidad.
+
+CONTEXTO:
+- Esta es la FASE 1A de cualquier flujo de trabajo
+- Tu respuesta será procesada por un agente automatizado, NO por un humano
+- El agente ejecuta comandos, instala dependencias, ajusta versiones y valida entornos
+- Si el agente tiene dudas, consultará de nuevo y deberás responder en el mismo formato
+
+ENTORNO DEL AGENTE (recolectado automáticamente):
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes del sistema: ${systemInfo.gestor_paquetes}
+- RAM disponible: ${systemInfo.ram_gb} GB
+- Espacio libre en disco: ${systemInfo.espacio_disco_gb} GB
+- Conexión a internet: ${systemInfo.conexion_internet}
+
+REGLAS:
+1. Analiza el objetivo recibido e identifica TODOS los requisitos previos mínimos e ideales
+2. Clasifica los requisitos por tipo: [software, hardware, archivos, credenciales, conocimiento, herramientas_fisicas, otros]
+3. Para cada requisito genera el comando de verificación más directo posible
+4. TODOS los comandos deben estar escritos en sintaxis válida para ${systemInfo.shell_disponible}. Nunca uses sintaxis de otro shell
+5. TODOS los comandos de instalación deben usar ${systemInfo.gestor_paquetes} como gestor del sistema si aplica
+6. Para elegir stack tecnológico evalúa la complejidad real del objetivo y elige la tecnología más adecuada
+7. Si el objetivo no especifica framework, elige la opción más adecuada según complejidad
+8. Evalúa compatibilidad entre dependencias
+9. Si el objetivo NO requiere entorno digital, omite comandos y documenta solo requisitos físicos
+10. Los valores de version_minima en software con versiones semánticas deben ser strings
+11. El campo salida_error en requisitos de hardware debe ser un número entero
+12. El campo salida_error en requisitos de software debe ser null nativo JSON cuando no hay patron de error claro
+13. Los requisitos de tipo hardware nunca deben tener instalar_automaticamente: true
+14. Los requisitos con obligatorio: false deben tener instalar_automaticamente: false
+15. Si RAM o disco son insuficientes, indícalo en "alertas_entorno" como crítico
+16. El campo salida_esperada en software debe reflejar el prefijo exacto de la version_minima
+17. Si accion_si_falta es "instalar" o "actualizar", comando_instalacion nunca puede ser null
+18. Sé minimalista: solo lo estrictamente necesario
+19. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+
+OBJETIVO RECIBIDO:
+${userObjective}
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "objetivo": "[descripcion breve del objetivo]",
+  "fase": "1A",
+  "accion": "validar",
+  "tipo_tarea": "[digital | fisico | mixto]",
+  "entorno_detectado": {
+    "os": "${systemInfo.os_nombre} ${systemInfo.os_version}",
+    "arquitectura": "${systemInfo.arquitectura}",
+    "shell": "${systemInfo.shell_disponible}",
+    "gestor_paquetes": "${systemInfo.gestor_paquetes}"
+  },
+  "decisiones_tomadas": [
+    {
+      "decision": "[nombre de la decision]",
+      "valor": "[lo que se eligio]",
+      "justificacion": "[por que es la mejor opcion]",
+      "alternativas_descartadas": [{ "nombre": "[opcion]", "razon": "[por que no aplica]" }]
+    }
+  ],
+  "descripcion": "[resumen de qué se necesita validar y por qué]",
+  "requisitos": [
+    {
+      "nombre": "[nombre del requisito]",
+      "tipo": "[software | hardware | archivo | credencial | herramienta_fisica | conocimiento | otro]",
+      "obligatorio": true,
+      "instalar_automaticamente": true,
+      "version_minima": "[string | numero | null]",
+      "version_recomendada": "[string | numero | null]",
+      "comparador": "[>= | > | == | null]",
+      "comparador_error": "[< | <= | null]",
+      "unidad": "[GB | MB | null]",
+      "comando_verificacion": "[comando en ${systemInfo.shell_disponible} o null]",
+      "salida_esperada": "[prefijo version | numero | null]",
+      "salida_error": "[numero | null]",
+      "accion_si_falta": "[instalar | actualizar | configurar | adquirir | liberar | ignorar]",
+      "comando_instalacion": "[comando o null si no es instalar/actualizar]"
+    }
+  ],
+  "compatibilidades": [],
+  "alertas_entorno": [{ "tipo": "[tipo]", "mensaje": "[descripcion]", "critico": true }],
+  "archivos_necesarios": [],
+  "credenciales_necesarias": [],
+  "validacion_final": { "comando": "[comando | null]", "salida_esperada": "[resultado | null]", "salida_error": "[error | null]" },
+  "progreso": "0%",
+  "siguiente_fase": "1B — configuración e instalación de requisitos faltantes"
+}`;
+}
+
+function buildPhase2Prompt(systemInfo: SystemInfo, userObjective: string, decisiones1A: Decision[], projectPath: string): string {
+  const decisionesStr = JSON.stringify(decisiones1A, null, 2);
+  
+  return `Eres un generador de estructura de proyectos para un agente automatizado.
+Tu función es inicializar el proyecto y crear toda la estructura de carpetas
+y archivos necesarios para comenzar el desarrollo.
+
+CONTEXTO:
+- Esta es la FASE 2 del flujo de trabajo
+- El entorno ya fue verificado e instalado en fases anteriores
+- Tu respuesta será procesada directamente por el agente, NO por un humano
+- El agente ejecutará cada comando y creará cada archivo exactamente como los indiques
+- TODOS los comandos deben ser ejecutables en ${systemInfo.shell_disponible}
+- Si algo puede hacerse con un comando CLI oficial, siempre prefiere eso sobre crear archivos manualmente
+
+ENTORNO DEL AGENTE:
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes del sistema: ${systemInfo.gestor_paquetes}
+
+DECISIONES TOMADAS EN FASE 1A:
+${decisionesStr}
+
+OBJETIVO DEL PROYECTO:
+${userObjective}
+
+RUTA BASE DEL PROYECTO:
+${projectPath}
+
+REGLAS:
+1. TODOS los comandos deben estar escritos en sintaxis válida para ${systemInfo.shell_disponible}
+2. Si el stack tiene CLI oficial (ng new, npm create vite, vue create, etc.), úsalo como primer comando
+3. Si el stack NO tiene CLI (HTML/CSS/JS puro), genera TODOS los comandos de creación de carpetas y archivos
+4. Después del scaffold inicial, indica siempre los archivos de configuración adicionales
+5. Cada archivo debe incluir su contenido completo listo para escribirse en disco
+6. Los comandos de creación deben ser atómicos: un comando por carpeta o archivo
+7. Todos los strings con comillas internas deben escaparse con \\"
+8. El bloque de validacion debe contener un comando ejecutable que confirme la estructura
+9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "fase": "2",
+  "accion": "scaffolding",
+  "tipo_scaffold": "[cli | manual]",
+  "descripcion": "[resumen de qué se va a crear y por qué]",
+  "nombre_proyecto": "[nombre en kebab-case]",
+  "ruta_proyecto": "${projectPath}",
+  "estructura_esperada": { "[carpeta]": { "[subcarpeta]": { "[archivo]": "[descripcion]" } } },
+  "pasos": [
+    {
+      "orden": 1,
+      "descripcion": "[qué hace este paso]",
+      "tipo": "[comando | archivo]",
+      "comando": "[comando ejecutable en ${systemInfo.shell_disponible} | null]",
+      "archivo": { "ruta": "[ruta relativa | null]", "operacion": "[crear | modificar]", "contenido": "[contenido completo | null]" },
+      "continuar_si_falla": false
+    }
+  ],
+  "validacion": {
+    "comando": "[comando que confirma estructura creada]",
+    "salida_esperada": "[patrón que confirma éxito]",
+    "salida_error": "[patrón que indica fallo]",
+    "comparador": "[contains | equals | startsWith]"
+  },
+  "progreso": "40%",
+  "siguiente_fase": "3 — Desarrollo por bloques"
+}`;
+}
+
+function buildPhase3Prompt(
+  systemInfo: SystemInfo, 
+  userObjective: string, 
+  decisiones1A: Decision[],
+  estructura2: Record<string, unknown>,
+  projectPath: string,
+  bloqueActual: string | null,
+  bloquesCompletados: string[]
+): string {
+  const decisionesStr = JSON.stringify(decisiones1A, null, 2);
+  const estructuraStr = JSON.stringify(estructura2, null, 2);
+  
+  return `Eres un generador de código para un agente automatizado.
+Tu función es desarrollar el proyecto por bloques funcionales e independientes,
+generando código listo para escribirse en disco y ejecutarse sin modificaciones.
+
+CONTEXTO:
+- Esta es la FASE 3 del flujo de trabajo
+- La estructura del proyecto ya fue creada en FASE 2
+- Tu respuesta será procesada directamente por el agente, NO por un humano
+- El agente escribirá cada archivo exactamente como lo indiques
+- Cada bloque debe ser funcional e independiente antes de pasar al siguiente
+- Si un bloque depende de otro, indícalo explícitamente en "dependencias_bloque"
+- TODOS los comandos deben ser ejecutables en ${systemInfo.shell_disponible}
+
+ENTORNO DEL AGENTE:
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes: ${systemInfo.gestor_paquetes}
+
+DECISIONES TOMADAS EN FASE 1A:
+${decisionesStr}
+
+ESTRUCTURA CREADA EN FASE 2:
+${estructuraStr}
+
+OBJETIVO DEL PROYECTO:
+${userObjective}
+
+RUTA DEL PROYECTO:
+${projectPath}
+
+BLOQUE A DESARROLLAR:
+${bloqueActual || 'Primer bloque - decidir bloques y comenzar'}
+
+BLOQUES YA COMPLETADOS:
+${bloquesCompletados.length > 0 ? bloquesCompletados.join(', ') : 'Ninguno'}
+
+REGLAS:
+1. TODOS los comandos deben estar escritos en sintaxis válida para ${systemInfo.shell_disponible}
+2. El código generado debe ser completo y funcional, nunca parcial
+3. Cada archivo debe incluir su contenido completo
+4. Si el bloque requiere dependencias adicionales, inclúyelas en "dependencias_adicionales"
+5. El comando de previsualización debe permitir verificar que el bloque funciona
+6. La validación debe ser un comando ejecutable con salida esperada concreta
+7. Si el stack tiene servidor de desarrollo, el comando debe iniciarlo
+8. El campo "bloques_pendientes" debe listar todos los bloques que faltan
+9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "fase": "3",
+  "accion": "desarrollo_bloque",
+  "bloque_actual": { "id": "[id unico]", "nombre": "[nombre]", "descripcion": "[qué incluye]", "dependencias_bloque": ["[ids requeridos]"] },
+  "dependencias_adicionales": [{ "nombre": "[paquete]", "comando_instalacion": "[comando]", "razon": "[por qué]" }],
+  "archivos": [{ "ruta": "[ruta relativa]", "operacion": "[crear | modificar]", "descripcion": "[para qué sirve]", "contenido": "[contenido completo]" }],
+  "comandos_post_escritura": [{ "orden": 1, "descripcion": "[qué hace]", "comando": "[comando ejecutable]", "continuar_si_falla": false }],
+  "previsualizacion": { "comando": "[comando para iniciar servidor/abrir]", "url": "[url | null]", "instruccion": "[qué verificar visualmente]" },
+  "validacion": { "comando": "[comando que confirma éxito]", "salida_esperada": "[patrón]", "salida_error": "[patrón error]", "comparador": "[contains | equals | startsWith]" },
+  "bloques_pendientes": [{ "id": "[id]", "nombre": "[nombre]", "depende_de": ["[ids]"] }],
+  "progreso": "[porcentaje]",
+  "siguiente_bloque": "[id siguiente | null si último]",
+  "siguiente_fase": "[null si hay más bloques | 4 — Validación y pruebas si último]"
+}`;
+}
+
+function buildErrorPrompt(systemInfo: SystemInfo, errorReport: ErrorReport): string {
+  return `Eres un solucionador de errores para un agente automatizado.
+Tu función es analizar el error reportado y devolver una solución ejecutable.
+
+CONTEXTO:
+- El agente está ejecutando un flujo de trabajo por fases y pasos
+- Cada paso tiene una validación y algo falló
+- Tu respuesta será procesada directamente por el agente, NO por un humano
+- El agente ejecutará los comandos y archivos que devuelvas exactamente como los escribas
+
+ENTORNO DEL AGENTE:
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes del sistema: ${systemInfo.gestor_paquetes}
+
+ERROR REPORTADO:
+${JSON.stringify(errorReport, null, 2)}
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "accion": "corregir",
+  "fase": "[fase del error]",
+  "paso": "[paso específico]",
+  "tipo_error": "[instalacion | configuracion | codigo | comando | compatibilidad | permisos | red | otro]",
+  "causa_raiz": "[explicación técnica breve]",
+  "archivos": [{ "ruta": "[ruta]", "operacion": "[crear | modificar | eliminar]", "contenido": "[contenido o null]" }],
+  "comandos": [{ "descripcion": "[qué hace]", "comando": "[comando en ${systemInfo.shell_disponible}]", "continuar_si_falla": false }],
+  "validacion": { "comando": "[comando verificación]", "salida_esperada": "[patrón]", "salida_error": "[patrón error]", "comparador": "[contains | equals | startsWith]" },
+  "informacion_adicional_requerida": null,
+  "rollback": { "necesario": false, "comandos": [] }
+}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTE HANDLER
+// ═══════════════════════════════════════════════════════════════
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { 
+      message, 
+      groqApiKey,
+      aiProvider,
+      action = 'process',
+      steps: providedSteps,
+      errorReport,
+      bloqueActual,
+    } = body;
+
+    // Detectar entorno del servidor
+    const systemInfo = await detectServerEnvironment();
+    console.log('[SystemInfo]', systemInfo);
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: REPORTAR ERROR
+    // ════════════════════════════════════════════════════════════
+    if (action === 'report_error' && errorReport) {
+      const errorPrompt = buildErrorPrompt(systemInfo, errorReport);
+      
+      // Enviar a IA externa vía navegador
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible' });
+      }
+      
+      const { sendPrompt, getBrowserStatus, openSite } = browserModule;
+      const currentStatus = getBrowserStatus();
+      const selectedProvider = aiProvider || 'chatgpt';
+      
+      if (currentStatus.currentSite !== selectedProvider) {
+        await openSite(selectedProvider);
+      }
+      
+      const promptResult = await sendPrompt(errorPrompt);
+      
+      if (!promptResult.success) {
+        return NextResponse.json({ success: false, error: promptResult.error });
+      }
+      
+      const solution = parseJSONResponse(promptResult.response);
+      
+      return NextResponse.json({ success: true, solution, rawResponse: promptResult.response });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: EJECUTAR PASOS (desde el frontend) - CON RETRY LOGIC
+    // ════════════════════════════════════════════════════════════
+    if (action === 'execute' && providedSteps) {
+      const results = [];
+      const maxRetries = 3;
+      
+      // Recuperar intentos previos del body o usar objeto vacío
+      const previousAttempts: Record<number, number> = body.retryAttempts || {};
+      
+      for (let i = 0; i < providedSteps.length; i++) {
+        const step = providedSteps[i];
+        const result = { 
+          step: i + 1, 
+          success: true, 
+          outputs: [] as string[], 
+          files: [] as string[],
+          retryCount: 0,
+          error: null as ErrorReport | null,
+        };
+        
+        // Inicializar contador de reintentos para este paso
+        const stepAttempts = previousAttempts[i] || 0;
+        result.retryCount = stepAttempts;
+        
+        // Ejecutar comandos EN ORDEN
+        if (step.comandos && step.comandos.length > 0) {
+          for (const cmd of step.comandos) {
+            console.log(`[Execute] Paso ${i + 1}, intento ${stepAttempts + 1}, comando: ${cmd}`);
+            const cmdResult = await executeCommand(cmd, systemInfo);
+            result.outputs.push(`$ ${cmd}\n${cmdResult.output}`);
+            
+            if (!cmdResult.success) {
+              result.success = false;
+              
+              // Crear ErrorReport
+              const errorReport: ErrorReport = {
+                fase: step.fase || `Paso ${i + 1}`,
+                paso: step.descripcion || step.paso || 'Ejecución',
+                accion_ejecutada: cmd,
+                tipo_error: 'comando',
+                mensaje_error: cmdResult.output,
+                codigo_salida: cmdResult.exitCode,
+                archivo_afectado: null,
+                linea_error: null,
+                contexto_archivo: null,
+                estructura_proyecto: { workDir: sessionState.currentWorkDir },
+                archivos_afectados: [],
+                intentos_previos: [{ 
+                  comando_intentado: cmd, 
+                  resultado: `Exit code: ${cmdResult.exitCode}` 
+                }],
+                entorno_adicional: {
+                  version_runtime: systemInfo.shell_disponible,
+                  version_gestor: systemInfo.gestor_paquetes,
+                },
+              };
+              
+              result.error = errorReport;
+              
+              // Si hemos alcanzado el máximo de reintentos, devolver error especial
+              if (stepAttempts >= maxRetries - 1) {
+                return NextResponse.json({
+                  success: false,
+                  maxRetriesReached: true,
+                  stepIndex: i,
+                  result,
+                  errorReport,
+                  retryAttempts: { ...previousAttempts, [i]: stepAttempts + 1 },
+                  message: `Se alcanzó el máximo de ${maxRetries} intentos para este paso`,
+                  userActionRequired: true,
+                  options: ['provide_info', 'skip_step', 'abort'],
+                });
+              }
+              
+              // Devolver con información de retry
+              return NextResponse.json({
+                success: false,
+                needsRetry: true,
+                stepIndex: i,
+                result,
+                errorReport,
+                retryAttempts: { ...previousAttempts, [i]: stepAttempts + 1 },
+                currentAttempt: stepAttempts + 1,
+                maxAttempts: maxRetries,
+                message: `Intento ${stepAttempts + 1} de ${maxRetries} falló`,
+              });
+            }
+          }
+        }
+        
+        // Si falló un comando, no crear archivos
+        if (!result.success) {
+          results.push(result);
+          continue;
+        }
+        
+        // Crear archivos
+        if (step.archivos && step.archivos.length > 0) {
+          for (const archivo of step.archivos) {
+            const fileResult = await createFile(archivo.nombre || archivo.ruta, archivo.contenido || '');
+            result.files.push(archivo.nombre || archivo.ruta);
+            result.outputs.push(fileResult.message);
+            if (!fileResult.success) {
+              result.success = false;
+              
+              // Crear ErrorReport para archivo
+              result.error = {
+                fase: step.fase || `Paso ${i + 1}`,
+                paso: step.descripcion || 'Creación de archivo',
+                accion_ejecutada: `Crear archivo: ${archivo.nombre || archivo.ruta}`,
+                tipo_error: 'codigo',
+                mensaje_error: fileResult.message,
+                codigo_salida: null,
+                archivo_afectado: archivo.nombre || archivo.ruta || null,
+                linea_error: null,
+                contexto_archivo: null,
+                estructura_proyecto: { workDir: sessionState.currentWorkDir },
+                archivos_afectados: [archivo.nombre || archivo.ruta].filter(Boolean) as string[],
+                intentos_previos: [],
+                entorno_adicional: {
+                  version_runtime: null,
+                  version_gestor: null,
+                },
+              };
+            }
+          }
+        }
+        
+        results.push(result);
+      }
+      
+      return NextResponse.json({
+        success: true,
+        results,
+        workDir: sessionState.currentWorkDir,
+        systemInfo,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: FASE 1A - ANÁLISIS DE REQUISITOS
+    // ════════════════════════════════════════════════════════════
+    if (action === 'phase_1a') {
+      if (!message) {
+        return NextResponse.json({ error: 'Se requiere un mensaje' }, { status: 400 });
+      }
+      
+      if (!groqApiKey) {
+        return NextResponse.json({
+          success: false,
+          error: 'Se requiere API Key de Groq',
+        });
+      }
+
+      // Interpretar con Groq primero
+      const interpretResult = await tryGroqProviders(groqApiKey, INTERPRET_PROMPT, message, 150);
+      
+      if (!interpretResult.success) {
+        return NextResponse.json({ success: false, error: interpretResult.error, systemInfo });
+      }
+      
+      const interpretation = parseInterpretation(interpretResult.content || '');
+      if (!interpretation) {
+        return NextResponse.json({ success: false, error: 'No se pudo interpretar', systemInfo });
+      }
+
+      // Si no necesita desarrollo
+      if (!interpretation.necesita_ia_web) {
+        if (interpretation.tipo === 'comando') {
+          return NextResponse.json({
+            success: true,
+            fase: 'directo',
+            interpretation,
+            steps: [{
+              id: 'cmd-1', fase: 'directo', paso: 'Ejecutar comando',
+              accion: 'ejecutar', descripcion: interpretation.comando || '',
+              status: 'pending', comandos: [interpretation.comando]
+            }],
+            systemInfo,
+          });
+        }
+        return NextResponse.json({ success: true, interpretation, systemInfo });
+      }
+
+      // Abrir navegador con IA externa
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible', systemInfo });
+      }
+
+      const { openSite, sendPrompt, getBrowserStatus, checkPlaywrightAvailable } = browserModule;
+      
+      const availability = await checkPlaywrightAvailable();
+      if (!availability.available) {
+        return NextResponse.json({ success: false, error: availability.message, systemInfo });
+      }
+
+      const currentStatus = getBrowserStatus();
+      const selectedProvider = aiProvider || 'chatgpt';
+      
+      if (currentStatus.currentSite !== selectedProvider) {
+        const siteResult = await openSite(selectedProvider);
+        if (!siteResult.success) {
+          return NextResponse.json({ success: false, error: siteResult.message, systemInfo });
+        }
+        if (siteResult.needsLogin) {
+          return NextResponse.json({
+            success: false, needsLogin: true,
+            message: `Necesitas login en ${selectedProvider}`,
+            currentUrl: siteResult.url, systemInfo,
+          });
+        }
+      }
+
+      // Enviar prompt FASE 1A
+      console.log('[FASE 1A] Enviando prompt de análisis...');
+      const phase1APrompt = buildPhase1APrompt(systemInfo, message);
+      const promptResult = await sendPrompt(phase1APrompt);
+      
+      if (!promptResult.success) {
+        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      }
+
+      const analysis = parseJSONResponse<Phase1AResponse>(promptResult.response);
+      if (!analysis) {
+        return NextResponse.json({
+          success: false, error: 'No se pudo parsear análisis',
+          rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+        });
+      }
+
+      // Guardar resultado para siguientes fases
+      sessionState.phase1AResult = analysis;
+      
+      // Construir pasos de ejecución para FASE 1B
+      const executionSteps: ExecutionStep[] = [];
+      
+      // Paso de análisis completado
+      executionSteps.push({
+        id: 'fase1a-complete',
+        fase: '1A', paso: 'Análisis completado',
+        accion: 'validar', descripcion: analysis.descripcion,
+        status: 'success', progreso: '0%',
+      });
+      
+      // Pasos de verificación e instalación para FASE 1B
+      if (analysis.requisitos && analysis.requisitos.length > 0) {
+        analysis.requisitos.forEach((req, idx) => {
+          // Verificación
+          if (req.comando_verificacion) {
+            executionSteps.push({
+              id: `1b-verify-${idx}`, fase: '1B',
+              paso: `Verificar: ${req.nombre}`,
+              accion: 'verificar',
+              descripcion: `Verificar si ${req.nombre} está instalado`,
+              status: 'pending',
+              comandos: [req.comando_verificacion],
+              validacion: `Debe mostrar: ${req.salida_esperada || 'versión'}`,
+              requisito_origen: req.nombre,
+            });
+          }
+          
+          // Instalación si aplica
+          if ((req.accion_si_falta === 'instalar' || req.accion_si_falta === 'actualizar') && req.comando_instalacion) {
+            executionSteps.push({
+              id: `1b-install-${idx}`, fase: '1B',
+              paso: `Instalar: ${req.nombre}`,
+              accion: 'instalar',
+              descripcion: `Instalar ${req.nombre}${req.version_minima ? ` v${req.version_minima}` : ''}`,
+              status: 'pending',
+              comandos: [req.comando_instalacion],
+              requisito_origen: req.nombre,
+            });
+          }
+        });
+      }
+
+      return NextResponse.json({
+        success: true,
+        fase: '1A',
+        analysis,
+        executionSteps,
+        systemInfo,
+        rawResponse: promptResult.response,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: FASE 2 - SCAFFOLDING
+    // ════════════════════════════════════════════════════════════
+    if (action === 'phase_2') {
+      if (!sessionState.phase1AResult) {
+        return NextResponse.json({ success: false, error: 'FASE 1A no completada' });
+      }
+
+      // Determinar ruta del proyecto
+      const projectName = message?.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30) || `proyecto-${Date.now()}`;
+      const projectPath = path.join(sessionState.currentWorkDir, projectName);
+      sessionState.projectPath = projectPath;
+
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible' });
+      }
+
+      const { sendPrompt } = browserModule;
+      
+      console.log('[FASE 2] Enviando prompt de scaffolding...');
+      const phase2Prompt = buildPhase2Prompt(
+        systemInfo, 
+        message || '', 
+        sessionState.phase1AResult.decisiones_tomadas,
+        projectPath
+      );
+      
+      const promptResult = await sendPrompt(phase2Prompt);
+      
+      if (!promptResult.success) {
+        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      }
+
+      const phase2Result = parseJSONResponse<Phase2Response>(promptResult.response);
+      if (!phase2Result) {
+        return NextResponse.json({
+          success: false, error: 'No se pudo parsear scaffolding',
+          rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+        });
+      }
+
+      sessionState.phase2Result = phase2Result;
+      sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+
+      // Construir pasos de ejecución
+      const executionSteps: ExecutionStep[] = [];
+      
+      // Agregar paso de FASE 1A
+      executionSteps.push({
+        id: 'fase1a-complete', fase: '1A', paso: 'Análisis completado',
+        accion: 'validar', descripcion: 'Requisitos analizados',
+        status: 'success', progreso: '20%',
+      });
+      
+      // Agregar paso de FASE 1B
+      executionSteps.push({
+        id: 'fase1b-complete', fase: '1B', paso: 'Instalación completada',
+        accion: 'instalar', descripcion: 'Dependencias instaladas',
+        status: 'success', progreso: '30%',
+      });
+      
+      // Agregar pasos de FASE 2
+      phase2Result.pasos.forEach((paso, idx) => {
+        if (paso.tipo === 'comando' && paso.comando) {
+          executionSteps.push({
+            id: `fase2-cmd-${idx}`, fase: '2',
+            paso: paso.descripcion,
+            accion: 'scaffolding',
+            descripcion: paso.descripcion,
+            status: 'pending',
+            comandos: [paso.comando],
+            tipo: 'comando',
+          });
+        } else if (paso.tipo === 'archivo' && paso.archivo) {
+          executionSteps.push({
+            id: `fase2-file-${idx}`, fase: '2',
+            paso: paso.descripcion,
+            accion: 'crear',
+            descripcion: paso.descripcion,
+            status: 'pending',
+            archivos: [{ nombre: paso.archivo.ruta, contenido: paso.archivo.contenido || '' }],
+            tipo: 'archivo',
+          });
+        }
+      });
+
+      return NextResponse.json({
+        success: true,
+        fase: '2',
+        phase2Result,
+        executionSteps,
+        projectPath,
+        systemInfo,
+        rawResponse: promptResult.response,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: FASE 3 - DESARROLLO POR BLOQUES
+    // ════════════════════════════════════════════════════════════
+    if (action === 'phase_3') {
+      if (!sessionState.phase1AResult || !sessionState.phase2Result) {
+        return NextResponse.json({ success: false, error: 'FASE 1A o FASE 2 no completadas' });
+      }
+
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible' });
+      }
+
+      const { sendPrompt } = browserModule;
+      
+      console.log('[FASE 3] Enviando prompt de desarrollo...');
+      const phase3Prompt = buildPhase3Prompt(
+        systemInfo, 
+        message || '', 
+        sessionState.phase1AResult.decisiones_tomadas,
+        sessionState.phase2Result.estructura_esperada,
+        sessionState.projectPath || sessionState.currentWorkDir,
+        bloqueActual || null,
+        sessionState.completedBlocks
+      );
+      
+      const promptResult = await sendPrompt(phase3Prompt);
+      
+      if (!promptResult.success) {
+        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      }
+
+      const phase3Result = parseJSONResponse<Phase3Response>(promptResult.response);
+      if (!phase3Result) {
+        return NextResponse.json({
+          success: false, error: 'No se pudo parsear desarrollo',
+          rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+        });
+      }
+
+      // Actualizar estado de bloques
+      if (phase3Result.bloque_actual) {
+        sessionState.currentBlock = phase3Result.bloque_actual.id;
+      }
+      sessionState.pendingBlocks = phase3Result.bloques_pendientes.map(b => b.id);
+
+      // Construir pasos de ejecución
+      const executionSteps: ExecutionStep[] = [];
+      
+      // Agregar archivos a crear
+      phase3Result.archivos.forEach((archivo, idx) => {
+        executionSteps.push({
+          id: `fase3-file-${idx}`, fase: '3',
+          paso: `Crear: ${archivo.ruta}`,
+          accion: 'crear',
+          descripcion: archivo.descripcion,
+          status: 'pending',
+          archivos: [{ nombre: archivo.ruta, contenido: archivo.contenido }],
+        });
+      });
+      
+      // Agregar comandos post-escritura
+      phase3Result.comandos_post_escritura?.forEach((cmd, idx) => {
+        executionSteps.push({
+          id: `fase3-cmd-${idx}`, fase: '3',
+          paso: cmd.descripcion,
+          accion: 'ejecutar',
+          descripcion: cmd.descripcion,
+          status: 'pending',
+          comandos: [cmd.comando],
+        });
+      });
+
+      return NextResponse.json({
+        success: true,
+        fase: '3',
+        phase3Result,
+        executionSteps,
+        completedBlocks: sessionState.completedBlocks,
+        pendingBlocks: sessionState.pendingBlocks,
+        progreso: phase3Result.progreso,
+        siguienteBloque: phase3Result.siguiente_bloque,
+        siguienteFase: phase3Result.siguiente_fase,
+        systemInfo,
+        rawResponse: promptResult.response,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: MARCAR BLOQUE COMPLETADO
+    // ════════════════════════════════════════════════════════════
+    if (action === 'complete_block') {
+      if (sessionState.currentBlock) {
+        sessionState.completedBlocks.push(sessionState.currentBlock);
+        sessionState.currentBlock = null;
+      }
+      
+      return NextResponse.json({
+        success: true,
+        completedBlocks: sessionState.completedBlocks,
+        pendingBlocks: sessionState.pendingBlocks,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: PROCESO COMPLETO AUTOMÁTICO
+    // ════════════════════════════════════════════════════════════
+    if (!message) {
+      return NextResponse.json({ error: 'Se requiere un mensaje' }, { status: 400 });
+    }
+
+    if (!groqApiKey) {
+      return NextResponse.json({
+        success: false,
+        error: 'Se requiere API Key de Groq',
+        instructions: ['Obtén tu key en: https://console.groq.com'],
+      });
+    }
+
+    // Interpretar con Groq
+    const interpretResult = await tryGroqProviders(groqApiKey, INTERPRET_PROMPT, message, 150);
+    
+    if (!interpretResult.success) {
+      return NextResponse.json({ success: false, error: interpretResult.error, systemInfo });
+    }
+    
+    const interpretation = parseInterpretation(interpretResult.content || '');
+    if (!interpretation) {
+      return NextResponse.json({ success: false, error: 'No se pudo interpretar', systemInfo });
+    }
+
+    if (!interpretation.necesita_ia_web) {
+      return NextResponse.json({ success: true, interpretation, systemInfo });
+    }
+
+    // Abrir navegador
+    let browserModule;
+    try {
+      browserModule = await import('../../../lib/browser');
+    } catch {
+      return NextResponse.json({ success: false, error: 'Playwright no disponible', systemInfo });
+    }
+
+    const { openSite, sendPrompt, getBrowserStatus, checkPlaywrightAvailable } = browserModule;
+    
+    const availability = await checkPlaywrightAvailable();
+    if (!availability.available) {
+      return NextResponse.json({ success: false, error: availability.message, systemInfo });
+    }
+
+    const selectedProvider = aiProvider || 'chatgpt';
+    const currentStatus = getBrowserStatus();
+    
+    if (currentStatus.currentSite !== selectedProvider) {
+      const siteResult = await openSite(selectedProvider);
+      if (!siteResult.success) {
+        return NextResponse.json({ success: false, error: siteResult.message, systemInfo });
+      }
+      if (siteResult.needsLogin) {
+        return NextResponse.json({
+          success: false, needsLogin: true,
+          message: `Necesitas login en ${selectedProvider}`,
+          currentUrl: siteResult.url, systemInfo,
+        });
+      }
+    }
+
+    // FASE 1A
+    console.log('[Auto] FASE 1A...');
+    const phase1APrompt = buildPhase1APrompt(systemInfo, message);
+    let promptResult = await sendPrompt(phase1APrompt);
+    
+    if (!promptResult.success) {
+      return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+    }
+
+    const analysis = parseJSONResponse<Phase1AResponse>(promptResult.response);
+    if (!analysis) {
+      return NextResponse.json({
+        success: false, error: 'No se pudo parsear análisis FASE 1A',
+        rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+      });
+    }
+
+    sessionState.phase1AResult = analysis;
+
+    // Construir todos los pasos
+    const allSteps: ExecutionStep[] = [];
+    
+    // FASE 1A
+    allSteps.push({
+      id: 'fase1a', fase: '1A', paso: 'Análisis de requisitos',
+      accion: 'validar', descripcion: analysis.descripcion,
+      status: 'success', progreso: '0%',
+    });
+    
+    // FASE 1B
+    if (analysis.requisitos) {
+      analysis.requisitos.forEach((req, idx) => {
+        if (req.comando_verificacion) {
+          allSteps.push({
+            id: `1b-verify-${idx}`, fase: '1B',
+            paso: `Verificar: ${req.nombre}`,
+            accion: 'verificar',
+            descripcion: `Verificar ${req.nombre}`,
+            status: 'pending', comandos: [req.comando_verificacion],
+          });
+        }
+        if ((req.accion_si_falta === 'instalar' || req.accion_si_falta === 'actualizar') && req.comando_instalacion) {
+          allSteps.push({
+            id: `1b-install-${idx}`, fase: '1B',
+            paso: `Instalar: ${req.nombre}`,
+            accion: 'instalar',
+            descripcion: `Instalar ${req.nombre}`,
+            status: 'pending', comandos: [req.comando_instalacion],
+          });
+        }
+      });
+    }
+    
+    // FASE 2
+    const projectName = message.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30);
+    const projectPath = path.join(sessionState.currentWorkDir, projectName);
+    sessionState.projectPath = projectPath;
+    
+    const phase2Prompt = buildPhase2Prompt(systemInfo, message, analysis.decisiones_tomadas, projectPath);
+    promptResult = await sendPrompt(phase2Prompt);
+    
+    if (promptResult.success) {
+      const phase2Result = parseJSONResponse<Phase2Response>(promptResult.response);
+      if (phase2Result) {
+        sessionState.phase2Result = phase2Result;
+        sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+        
+        phase2Result.pasos.forEach((paso, idx) => {
+          if (paso.tipo === 'comando' && paso.comando) {
+            allSteps.push({
+              id: `fase2-cmd-${idx}`, fase: '2',
+              paso: paso.descripcion,
+              accion: 'scaffolding', descripcion: paso.descripcion,
+              status: 'pending', comandos: [paso.comando],
+            });
+          } else if (paso.tipo === 'archivo' && paso.archivo) {
+            allSteps.push({
+              id: `fase2-file-${idx}`, fase: '2',
+              paso: paso.descripcion,
+              accion: 'crear', descripcion: paso.descripcion,
+              status: 'pending',
+              archivos: [{ nombre: paso.archivo.ruta, contenido: paso.archivo.contenido || '' }],
+            });
+          }
+        });
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      fase: 'completo',
+      steps: allSteps,
+      analysis,
+      interpretation,
+      projectPath: sessionState.projectPath,
+      systemInfo,
+    });
+
+  } catch (error) {
+    console.error('Process API error:', error);
+    return NextResponse.json({ success: false, error: String(error) });
+  }
+}
+
+export async function GET() {
+  return NextResponse.json({
+    message: 'Sonny Agent Process API v2.1',
+    phases: ['1A - Análisis', '1B - Instalación', '2 - Scaffolding', '3 - Desarrollo', '4 - Validación'],
+    actions: ['process', 'phase_1a', 'phase_2', 'phase_3', 'execute', 'report_error', 'complete_block'],
+  });
+}
