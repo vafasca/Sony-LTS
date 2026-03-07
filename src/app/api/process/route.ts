@@ -600,11 +600,112 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   }
 }
 
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeProjectRelativePath(inputPath: string): string {
+  const normalizedInput = String(inputPath || '').trim().replace(/\\/g, '/');
+  if (!normalizedInput) return normalizedInput;
+
+  if (path.isAbsolute(normalizedInput)) {
+    return normalizedInput;
+  }
+
+  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
+  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
+    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
+  }
+
+  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
+  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
+    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
+  }
+
+  return normalizedInput;
+}
+
+async function resolveProjectRootPath(): Promise<string> {
+  const candidates = new Set<string>();
+  if (sessionState.currentWorkDir) candidates.add(sessionState.currentWorkDir);
+  if (sessionState.projectPath) candidates.add(sessionState.projectPath);
+  if (sessionState.projectPath && sessionState.phase2Result?.nombre_proyecto) {
+    candidates.add(path.join(sessionState.projectPath, sessionState.phase2Result.nombre_proyecto));
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const angularJson = path.join(candidate, 'angular.json');
+    const packageJson = path.join(candidate, 'package.json');
+    const srcDir = path.join(candidate, 'src');
+    if (await pathExists(angularJson) || await pathExists(packageJson) || await pathExists(srcDir)) {
+      return candidate;
+    }
+  }
+
+  return sessionState.currentWorkDir || sessionState.projectPath || process.cwd();
+}
+
+async function buildProjectStructureSnapshot(rootPath: string): Promise<Record<string, unknown>> {
+  const snapshot: Record<string, unknown> = {};
+  const maxFiles = 250;
+  const maxContentSize = 8000;
+  let fileCount = 0;
+
+  const ignored = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out']);
+
+  const walk = async (absDir: string, relDir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await fs.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+
+    for (const entry of entries) {
+      if (fileCount >= maxFiles) return;
+      if (ignored.has(entry.name)) continue;
+      const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+      const absPath = path.join(absDir, entry.name);
+
+      if (entry.isDirectory()) {
+        await walk(absPath, relPath);
+      } else if (entry.isFile()) {
+        try {
+          const stat = await fs.stat(absPath);
+          if (stat.size > maxContentSize) {
+            snapshot[relPath] = `[archivo omitido por tamaño: ${stat.size} bytes]`;
+          } else {
+            const content = await fs.readFile(absPath, 'utf-8');
+            snapshot[relPath] = content;
+          }
+          fileCount++;
+        } catch {
+          snapshot[relPath] = '[no se pudo leer archivo]';
+          fileCount++;
+        }
+      }
+    }
+  };
+
+  await walk(rootPath, '');
+  return snapshot;
+}
+
 async function createFile(nombre: string, contenido: string): Promise<{ success: boolean; message: string }> {
   console.log(`[createFile] Creando: ${nombre}`);
   
   try {
-    const filePath = path.isAbsolute(nombre) ? nombre : path.join(sessionState.currentWorkDir, nombre);
+    const normalizedTarget = normalizeProjectRelativePath(nombre);
+    const filePath = path.isAbsolute(normalizedTarget) ? normalizedTarget : path.join(sessionState.currentWorkDir, normalizedTarget);
     const dir = path.dirname(filePath);
     
     // Crear directorios si no existen
@@ -1637,13 +1738,18 @@ export async function POST(request: NextRequest) {
 
       const { sendPrompt } = browserModule;
       
+      const resolvedProjectRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = resolvedProjectRoot;
+      sessionState.projectPath = resolvedProjectRoot;
+      const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
+
       console.log('[FASE 3] Enviando prompt de desarrollo...');
       const phase3Prompt = buildPhase3Prompt(
         systemInfo, 
         message || '', 
         sessionState.phase1AResult.decisiones_tomadas,
-        sessionState.phase2Result.estructura_esperada,
-        sessionState.projectPath || sessionState.currentWorkDir,
+        realStructureSnapshot,
+        resolvedProjectRoot,
         bloqueActual || null,
         sessionState.completedBlocks
       );
