@@ -702,6 +702,7 @@ export default function SonnyAgent() {
     let currentWorkDir = workDir;
     const totalSteps = steps.length;
     const requirementStatus: Record<string, { verified: boolean; output: string; expected: string; metExpectation: boolean }> = {};
+    const maxFixAttempts = 3;
 
     const evaluateVerificationExpectation = (output: string, expected: string, success: boolean): boolean => {
       if (!success) return false;
@@ -740,6 +741,26 @@ export default function SonnyAgent() {
 
       return outputUpper.includes(expectedUpper);
     };
+
+    const buildStepPayload = (targetStep: ExecutionStep, cmd?: string) => ({
+      id: targetStep.id,
+      fase: targetStep.fase,
+      paso: targetStep.descripcion,
+      accion: targetStep.accion,
+      descripcion: targetStep.descripcion,
+      validacion: targetStep.validacion,
+      requisito_origen: targetStep.requisito_origen,
+      ...(cmd ? { comandos: [cmd] } : {}),
+      ...(targetStep.archivos ? { archivos: targetStep.archivos } : {}),
+    });
+
+    const collectRequirementSnapshot = () =>
+      Object.entries(requirementStatus).map(([name, status]) => ({
+        nombre: name,
+        expected: status.expected || 'OK',
+        output: status.output,
+        status: status.metExpectation ? 'OK' : (status.output.toUpperCase().includes('MISSING') ? 'MISSING' : 'OUT_OF_RANGE'),
+      }));
     
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -797,11 +818,7 @@ ${skipOutput}`, status: "success" } : tc
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   action: "execute",
-                  steps: [{
-                    accion: step.accion,
-                    descripcion: step.descripcion,
-                    comandos: [cmd],
-                  }],
+                  steps: [buildStepPayload(step, cmd)],
                   ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
                   retryAttempts: { 0: localRetryAttempts[i] || 0 },
                 }),
@@ -839,6 +856,143 @@ ${skipOutput}`, status: "success" } : tc
                 
                 // Si alcanzó máximo de reintentos, mostrar diálogo
                 if (execData.maxRetriesReached) {
+                  let autoFixApplied = false;
+
+                  for (let fixAttempt = 1; fixAttempt <= maxFixAttempts; fixAttempt++) {
+                    setTerminalCommands(prev => prev.map((tc, idx) =>
+                      idx === prev.length - 1
+                        ? {
+                          ...tc,
+                          output: `${tc.output}\n🤖 Resolviendo error con IA (intento ${fixAttempt}/${maxFixAttempts})...`,
+                        }
+                        : tc
+                    ));
+
+                    setExecutionSteps(prev => prev.map((s, idx) =>
+                      idx === i
+                        ? { ...s, output: `${s.output || ''}\n🤖 Intento de corrección IA ${fixAttempt}/${maxFixAttempts}...` }
+                        : s
+                    ));
+
+                    try {
+                      const reportResponse = await fetch('/api/process', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          action: 'report_error',
+                          aiProvider: selectedAI,
+                          errorReport: {
+                            ...(execData.errorReport || {}),
+                            fase: execData.errorReport?.fase || step.fase || `Paso ${stepNumber}`,
+                            paso: execData.errorReport?.paso || step.descripcion,
+                            accion_ejecutada: cmd,
+                            estructura_proyecto: {
+                              ...(execData.errorReport?.estructura_proyecto || {}),
+                              workDir: currentWorkDir,
+                            },
+                            entorno_adicional: {
+                              ...(execData.errorReport?.entorno_adicional || {}),
+                              requirement_checks: collectRequirementSnapshot(),
+                            },
+                          },
+                        }),
+                      });
+
+                      const reportData = await reportResponse.json();
+                      const solution = reportData.solution;
+                      const fixCommands = Array.isArray(solution?.comandos)
+                        ? solution.comandos.map((entry: { comando?: string }) => entry?.comando).filter(Boolean)
+                        : [];
+                      const fixFiles = Array.isArray(solution?.archivos)
+                        ? solution.archivos.map((entry: { ruta?: string; nombre?: string; contenido?: string | null }) => ({
+                          nombre: entry?.ruta || entry?.nombre,
+                          contenido: entry?.contenido || '',
+                        })).filter((entry: { nombre?: string }) => Boolean(entry.nombre))
+                        : [];
+
+                      if (!reportResponse.ok || !reportData.success || (!fixCommands.length && !fixFiles.length)) {
+                        setTerminalCommands(prev => prev.map((tc, idx) =>
+                          idx === prev.length - 1
+                            ? {
+                              ...tc,
+                              output: `${tc.output}\n⚠️ Corrección IA ${fixAttempt}/${maxFixAttempts} sin cambios aplicables.`,
+                            }
+                            : tc
+                        ));
+                        continue;
+                      }
+
+                      const fixStep: ExecutionStep = {
+                        ...step,
+                        id: `${step.id}-fix-${fixAttempt}`,
+                        accion: 'corregir',
+                        descripcion: solution?.paso || `Corrección automática para ${step.descripcion}`,
+                        comandos: fixCommands,
+                        archivos: fixFiles,
+                        status: 'running',
+                      };
+
+                      const fixResponse = await fetch('/api/process', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          action: 'execute',
+                          steps: [buildStepPayload(fixStep)],
+                          ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
+                          retryAttempts: { 0: 0 },
+                        }),
+                      });
+
+                      const fixData = await fixResponse.json();
+                      if (typeof fixData.workDir === 'string' && fixData.workDir) {
+                        currentWorkDir = fixData.workDir;
+                        setCurrentProjectRoot(currentWorkDir);
+                      }
+
+                      const fixOk = fixResponse.ok && fixData.success && fixData.results?.[0]?.success;
+                      if (fixOk) {
+                        autoFixApplied = true;
+                        await refreshProjectFiles(currentWorkDir || currentProjectRoot || projectFolder);
+                        localRetryAttempts = { ...localRetryAttempts, [i]: 0 };
+                        setRetryAttempts(localRetryAttempts);
+
+                        setTerminalCommands(prev => prev.map((tc, idx) =>
+                          idx === prev.length - 1
+                            ? {
+                              ...tc,
+                              output: `${tc.output}\n✅ Corrección IA aplicada. Reintentando paso original...`,
+                              status: 'running',
+                            }
+                            : tc
+                        ));
+                        break;
+                      }
+
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}\n⚠️ Corrección IA ${fixAttempt}/${maxFixAttempts} falló: ${fixData.errorReport?.mensaje_error || fixData.error || 'error desconocido'}`,
+                          }
+                          : tc
+                      ));
+                    } catch (autoFixError) {
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}\n⚠️ Error ejecutando corrección IA ${fixAttempt}/${maxFixAttempts}: ${autoFixError}`,
+                          }
+                          : tc
+                      ));
+                    }
+                  }
+
+                  if (autoFixApplied) {
+                    await new Promise(resolve => setTimeout(resolve, 800));
+                    continue;
+                  }
+
                   setCurrentError({
                     stepIndex: i,
                     fase: execData.errorReport?.fase || step.fase || `Paso ${stepNumber}`,
@@ -949,11 +1103,7 @@ ${skipOutput}`, status: "success" } : tc
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'execute',
-              steps: [{
-                accion: step.accion,
-                descripcion: step.descripcion,
-                archivos: step.archivos,
-              }],
+              steps: [buildStepPayload(step)],
               ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
               retryAttempts: { 0: 0 },
             }),
@@ -1004,7 +1154,7 @@ Error creando/actualizando archivos: ${fileError}`;
     }
 
     return true;
-  }, [retryAttempts, refreshProjectFiles, currentProjectRoot, projectFolder]);
+  }, [retryAttempts, refreshProjectFiles, currentProjectRoot, projectFolder, selectedAI]);
 
   const copyCode = useCallback((content: string) => {
     navigator.clipboard.writeText(content);

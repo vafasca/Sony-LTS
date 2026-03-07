@@ -227,6 +227,7 @@ interface ErrorReport {
   entorno_adicional: {
     version_runtime: string | null;
     version_gestor: string | null;
+    requirement_checks?: Array<Record<string, unknown>>;
   };
 }
 
@@ -1170,6 +1171,29 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 }
 
 function buildErrorPrompt(systemInfo: SystemInfo, errorReport: ErrorReport): string {
+  const phase1Requirements = sessionState.phase1AResult?.requisitos || [];
+  const requirementChecks = Array.isArray(errorReport.entorno_adicional?.requirement_checks)
+    ? errorReport.entorno_adicional.requirement_checks
+    : [];
+
+  const requirementSummary = phase1Requirements.length > 0
+    ? phase1Requirements.map((req, idx) => {
+      const check = requirementChecks.find((entry: Record<string, unknown>) =>
+        String(entry.nombre || '').toLowerCase() === String(req.nombre || '').toLowerCase()
+      ) as Record<string, unknown> | undefined;
+
+      const detectedState = check?.status ? String(check.status) : 'UNKNOWN';
+      const detectedValue = check?.output ? String(check.output) : 'Sin verificación ejecutada';
+
+      return `${idx + 1}. ${req.nombre}
+   - versión mínima: ${req.version_minima ?? 'n/a'}
+   - versión recomendada: ${req.version_recomendada ?? 'n/a'}
+   - expected marker: ${req.salida_esperada ?? 'OK'}
+   - estado detectado: ${detectedState}
+   - salida detectada: ${detectedValue}`;
+    }).join('\n')
+    : 'No hay requisitos de FASE 1A registrados en sesión.';
+
   return `Eres un solucionador de errores para un agente automatizado.
 Tu función es analizar el error reportado y devolver una solución ejecutable.
 
@@ -1187,6 +1211,14 @@ ENTORNO DEL AGENTE:
 
 ERROR REPORTADO:
 ${JSON.stringify(errorReport, null, 2)}
+
+REQUISITOS VALIDADOS (FASE 1A):
+${requirementSummary}
+
+INSTRUCCIONES DE CORRECCIÓN:
+- Usa los requisitos validados para escoger comandos compatibles con versiones reales.
+- Si detectas stack Angular standalone, evita asumir NgModule tradicional y usa flags como --standalone o --skip-import cuando aplique.
+- Prioriza soluciones idempotentes y seguras para reintento automático.
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
