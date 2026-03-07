@@ -619,6 +619,36 @@ function normalizeProjectRelativePath(inputPath: string): string {
     return normalizedInput;
   }
 
+  // Si la IA devuelve prefijos redundantes (workspace/proyecto/.../src/app/file),
+  // recortamos al segmento de proyecto para escribir en el cwd correcto.
+  const keepFromMarkers = ['src/', 'public/', '.vscode/', 'assets/'];
+  for (const marker of keepFromMarkers) {
+    const markerIndex = normalizedInput.indexOf(marker);
+    if (markerIndex > 0) {
+      return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+    }
+  }
+
+  // Archivos típicos de raíz del proyecto Angular.
+  const rootFiles = [
+    'angular.json',
+    'package.json',
+    'package-lock.json',
+    'README.md',
+    'tsconfig.json',
+    'tsconfig.app.json',
+    'tsconfig.spec.json',
+    '.gitignore',
+    '.editorconfig',
+    '.prettierrc',
+  ];
+  for (const rootFile of rootFiles) {
+    const suffix = `/${rootFile}`;
+    if (normalizedInput.endsWith(suffix)) {
+      return rootFile;
+    }
+  }
+
   const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
   if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
     return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
@@ -631,6 +661,7 @@ function normalizeProjectRelativePath(inputPath: string): string {
 
   return normalizedInput;
 }
+
 
 async function resolveProjectRootPath(): Promise<string> {
   const candidates: string[] = [];
@@ -1265,6 +1296,10 @@ REGLAS:
 9. El campo "bloques_pendientes" debe listar todos los bloques que faltan después del actual
 10. No incluyas campos ni llaves fuera del esquema JSON definido
 11. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
+12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \" (ejemplo: \"texto\")
+13. No uses markdown (sin enlaces tipo [texto](url), sin bloques fenced), solo strings JSON puros
+14. Si incluyes comandos PowerShell con rutas, usa comillas escapadas válidas dentro del JSON
+15. No encadenes múltiples objetos JSON en una sola respuesta; devuelve exactamente UN objeto raíz
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
