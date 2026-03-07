@@ -1067,6 +1067,20 @@ function parseJSONResponse<T>(response: string): T | null {
     return text;
   };
 
+  const normalizeSingleQuotedFieldValues = (input: string, fieldNames: string[]): string => {
+    let text = input;
+
+    for (const field of fieldNames) {
+      const pattern = new RegExp(`"${field}"\\s*:\\s*'([^'\\\\]*(?:\\\\.[^'\\\\]*)*)'`, 'g');
+      text = text.replace(pattern, (_match, group: string) => {
+        const safeGroup = String(group || '').replace(/"/g, '\\"');
+        return `"${field}": "${safeGroup}"`;
+      });
+    }
+
+    return text;
+  };
+
   const repairCommonJsonIssues = (raw: string): string => {
     const noFences = normalize(raw)
       .replace(/^```json\s*/i, '')
@@ -1085,9 +1099,24 @@ function parseJSONResponse<T>(response: string): T | null {
       'causa_raiz',
     ]);
 
-    return escapedFieldValues
-      // Reparar valores string con comillas simples: "campo": 'valor' -> "campo": "valor"
-      .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"')
+    const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues, [
+      'salida_esperada',
+      'salida_error',
+      'comparador',
+      'progreso',
+      'siguiente_fase',
+      'stack',
+      'tipo_proyecto',
+      'accion',
+      'fase',
+      'id',
+      'nivel',
+      'nombre',
+      'motivo_omision',
+      'url',
+    ]);
+
+    return normalizedSingleQuotes
       .replace(/,\s*([}\]])/g, '$1')
       .trim();
   };
