@@ -654,12 +654,17 @@ async function resolveProjectRootPath(): Promise<string> {
 }
 
 async function buildProjectStructureSnapshot(rootPath: string): Promise<Record<string, unknown>> {
-  const snapshot: Record<string, unknown> = {};
-  const maxFiles = 250;
-  const maxContentSize = 8000;
-  let fileCount = 0;
+  const maxEntries = 250;
+  let entryCount = 0;
+  let totalFiles = 0;
+  let totalDirectories = 0;
+  let truncated = false;
 
-  const ignored = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out']);
+  const entriesList: string[] = [];
+  const ignored = new Set([
+    'node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out',
+    '.angular', '.cache', 'tmp', 'temp'
+  ]);
 
   const walk = async (absDir: string, relDir: string): Promise<void> => {
     let entries;
@@ -669,36 +674,52 @@ async function buildProjectStructureSnapshot(rootPath: string): Promise<Record<s
       return;
     }
 
-    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    entries.sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    });
 
     for (const entry of entries) {
-      if (fileCount >= maxFiles) return;
       if (ignored.has(entry.name)) continue;
       const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
       const absPath = path.join(absDir, entry.name);
 
       if (entry.isDirectory()) {
+        totalDirectories++;
+        if (entryCount < maxEntries) {
+          entriesList.push(relPath);
+          entryCount++;
+        } else {
+          truncated = true;
+        }
         await walk(absPath, relPath);
       } else if (entry.isFile()) {
-        try {
-          const stat = await fs.stat(absPath);
-          if (stat.size > maxContentSize) {
-            snapshot[relPath] = `[archivo omitido por tamaño: ${stat.size} bytes]`;
-          } else {
-            const content = await fs.readFile(absPath, 'utf-8');
-            snapshot[relPath] = content;
-          }
-          fileCount++;
-        } catch {
-          snapshot[relPath] = '[no se pudo leer archivo]';
-          fileCount++;
+        totalFiles++;
+        if (entryCount < maxEntries) {
+          entriesList.push(relPath);
+          entryCount++;
+        } else {
+          truncated = true;
         }
       }
     }
   };
 
   await walk(rootPath, '');
-  return snapshot;
+
+  return {
+    tipo: 'listado_rutas_relativas',
+    raiz: rootPath,
+    paths: entriesList,
+    resumen: {
+      archivos: totalFiles,
+      directorios: totalDirectories,
+      entradas_mostradas: entriesList.length,
+      truncado: truncated,
+    },
+    nota: 'Snapshot compacto para FASE 3: solo rutas relativas visibles (sin contenido de archivos).',
+  };
 }
 
 async function createFile(nombre: string, contenido: string): Promise<{ success: boolean; message: string }> {
@@ -1124,7 +1145,7 @@ ENTORNO DEL AGENTE:
 DECISIONES TOMADAS EN FASE 1A:
 ${decisionesStr}
 
-ESTRUCTURA CREADA EN FASE 2:
+ESTRUCTURA CREADA EN FASE 2 (solo rutas visibles, sin contenido):
 ${estructuraStr}
 
 OBJETIVO DEL PROYECTO:
