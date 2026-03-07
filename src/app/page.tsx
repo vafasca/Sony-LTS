@@ -750,8 +750,10 @@ export default function SonnyAgent() {
       descripcion: targetStep.descripcion,
       validacion: targetStep.validacion,
       requisito_origen: targetStep.requisito_origen,
-      ...(cmd ? { comandos: [cmd] } : {}),
-      ...(targetStep.archivos ? { archivos: targetStep.archivos } : {}),
+      ...(cmd
+        ? { comandos: [cmd] }
+        : (targetStep.comandos && targetStep.comandos.length > 0 ? { comandos: targetStep.comandos } : {})),
+      ...(targetStep.archivos && targetStep.archivos.length > 0 ? { archivos: targetStep.archivos } : {}),
     });
 
     const collectRequirementSnapshot = () =>
@@ -901,7 +903,11 @@ ${skipOutput}`, status: "success" } : tc
                       const reportData = await reportResponse.json();
                       const solution = reportData.solution;
                       const fixCommands = Array.isArray(solution?.comandos)
-                        ? solution.comandos.map((entry: { comando?: string }) => entry?.comando).filter(Boolean)
+                        ? solution.comandos
+                          .map((entry: string | { comando?: string }) =>
+                            typeof entry === 'string' ? entry : entry?.comando
+                          )
+                          .filter((value: string | undefined): value is string => Boolean(value))
                         : [];
                       const fixFiles = Array.isArray(solution?.archivos)
                         ? solution.archivos.map((entry: { ruta?: string; nombre?: string; contenido?: string | null }) => ({
@@ -931,6 +937,17 @@ ${skipOutput}`, status: "success" } : tc
                         archivos: fixFiles,
                         status: 'running',
                       };
+
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}
+🛠️ Aplicando corrección IA ${fixAttempt}/${maxFixAttempts}: ${fixCommands.join(' && ') || 'sin comandos'}`,
+                            status: 'running',
+                          }
+                          : tc
+                      ));
 
                       const fixResponse = await fetch('/api/process', {
                         method: 'POST',
