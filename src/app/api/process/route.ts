@@ -1086,6 +1086,8 @@ function parseJSONResponse<T>(response: string): T | null {
     ]);
 
     return escapedFieldValues
+      // Reparar valores string con comillas simples: "campo": 'valor' -> "campo": "valor"
+      .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"')
       .replace(/,\s*([}\]])/g, '$1')
       .trim();
   };
