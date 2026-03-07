@@ -1006,8 +1006,16 @@ ${skipOutput}`, status: "success" } : tc
                   }
 
                   if (autoFixApplied) {
-                    await new Promise(resolve => setTimeout(resolve, 800));
-                    continue;
+                    // La corrección IA ya se ejecutó como un paso independiente.
+                    // Evitamos reintentar el comando original defectuoso para no entrar
+                    // en bucles cuando la corrección reemplaza la validación/comando.
+                    retryLoop = false;
+                    stepSuccess = true;
+                    const autoFixMessage = '✅ Comando original omitido después de corrección IA aplicada.';
+                    stepOutput = stepOutput
+                      ? `${stepOutput}\n${autoFixMessage}`
+                      : autoFixMessage;
+                    break;
                   }
 
                   setCurrentError({
