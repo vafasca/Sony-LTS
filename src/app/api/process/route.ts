@@ -836,8 +836,27 @@ async function createFile(nombre: string, contenido: string): Promise<{ success:
   console.log(`[createFile] Creando: ${nombre}`);
   
   try {
+    let targetRoot = sessionState.currentWorkDir;
+    if (sessionState.phase2Result || sessionState.projectPath) {
+      targetRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = targetRoot;
+      sessionState.projectPath = targetRoot;
+    }
+
     const normalizedTarget = normalizeProjectRelativePath(nombre);
-    const filePath = path.isAbsolute(normalizedTarget) ? normalizedTarget : path.join(sessionState.currentWorkDir, normalizedTarget);
+    const candidatePath = path.isAbsolute(normalizedTarget)
+      ? normalizedTarget
+      : path.join(targetRoot, normalizedTarget);
+    const filePath = path.resolve(candidatePath);
+    const resolvedRoot = path.resolve(targetRoot);
+
+    if (!(filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}${path.sep}`))) {
+      return {
+        success: false,
+        message: `Ruta fuera del proyecto detectada y bloqueada: ${filePath}`,
+      };
+    }
+
     const dir = path.dirname(filePath);
     
     // Crear directorios si no existen
@@ -1251,6 +1270,7 @@ REGLAS:
 8. El bloque de validacion debe contener un comando ejecutable que confirme la estructura
 9. Si usas generadores CLI y ya existe RUTA BASE DEL PROYECTO, NO uses rutas absolutas en --directory; usa nombre relativo o solo nombre de proyecto
 10. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+11. En validaciones PowerShell, usa operadores lógicos entre expresiones (ejemplo: if ((Test-Path "a") -and (Test-Path "b")) { "OK" } else { "ERROR" }); nunca uses -and como parámetro de Test-Path
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1348,6 +1368,11 @@ REGLAS:
 13. No uses markdown (sin enlaces tipo [texto](url), sin bloques fenced), solo strings JSON puros
 14. Si incluyes comandos PowerShell con rutas, usa comillas escapadas válidas dentro del JSON
 15. No encadenes múltiples objetos JSON en una sola respuesta; devuelve exactamente UN objeto raíz
+16. Trata "RUTA DEL PROYECTO" como raíz obligatoria de escritura; NUNCA devuelvas rutas absolutas ni salgas de esa raíz
+17. Si la estructura existente ya contiene archivos Angular standalone (por ejemplo src/app/app.ts, src/app/app.html, src/app/app.css), reutiliza ESOS nombres y NO inventes app.component.ts/app.component.html/app.component.css
+18. Solo modifica/crea rutas coherentes con "ESTRUCTURA CREADA EN FASE 2"; si necesitas un archivo nuevo, colócalo dentro de carpetas ya existentes del proyecto
+19. No propongas crear archivos en prefijos de workspace ajenos (ej. src/... fuera del proyecto o rutas al nivel del workspace padre)
+20. En el primer bloque, prioriza actualizar los archivos base detectados en la estructura real antes de crear rutas alternativas
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
