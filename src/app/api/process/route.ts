@@ -650,13 +650,39 @@ function normalizeProjectRelativePath(inputPath: string): string {
     return normalizedInput;
   }
 
-  // Si la IA devuelve prefijos redundantes (workspace/proyecto/.../src/app/file),
-  // recortamos al segmento de proyecto para escribir en el cwd correcto.
+  // Si la ruta ya viene prefijada con el nombre del proyecto de FASE 2,
+  // solo recortar el prefijo cuando el cwd actual YA es ese proyecto.
+  const phase2ProjectName = path.basename(sessionState.phase2Result?.nombre_proyecto || '').replace(/\\/g, '/');
+  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
+  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
+
+  if (phase2ProjectName && (normalizedInput === phase2ProjectName || normalizedInput.startsWith(`${phase2ProjectName}/`))) {
+    const cwdIsProjectRoot = cwdBase === phase2ProjectName || projectBase === phase2ProjectName;
+    if (cwdIsProjectRoot) {
+      return normalizedInput.slice(phase2ProjectName.length).replace(/^\/+/, '');
+    }
+    return normalizedInput;
+  }
+
+  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
+    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
+  }
+
+  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
+    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
+  }
+
+  // Si la IA devuelve prefijos redundantes profundos (workspace/proyecto/src/app/file),
+  // recortamos desde marcadores conocidos. No recortamos cuando solo existe
+  // un prefijo simple (ej. "landing-page-libreria/src/..."), porque podría ser válido.
   const keepFromMarkers = ['src/', 'public/', '.vscode/', 'assets/'];
   for (const marker of keepFromMarkers) {
     const markerIndex = normalizedInput.indexOf(marker);
     if (markerIndex > 0) {
-      return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+      const prefixBeforeMarker = normalizedInput.slice(0, markerIndex).replace(/\/+$/, '');
+      if (prefixBeforeMarker.includes('/')) {
+        return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+      }
     }
   }
 
@@ -678,16 +704,6 @@ function normalizeProjectRelativePath(inputPath: string): string {
     if (normalizedInput.endsWith(suffix)) {
       return rootFile;
     }
-  }
-
-  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
-  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
-    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
-  }
-
-  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
-  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
-    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
   }
 
   return normalizedInput;
