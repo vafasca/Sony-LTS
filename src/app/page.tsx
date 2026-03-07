@@ -941,42 +941,54 @@ ${skipOutput}`, status: "success" } : tc
         }
       }
 
-      // Crear archivos del paso
+            // Crear/editar archivos del paso en disco (backend), no solo en estado local
       if (stepSuccess && step.archivos && step.archivos.length > 0) {
-        for (const archivo of step.archivos) {
-          if (archivo.contenido) {
-            try {
-              // Agregar archivo a la lista de generados
-              const newFile: GeneratedFile = {
-                nombre: archivo.nombre,
-                ruta: archivo.nombre,
-                contenido: archivo.contenido,
-              };
-              setGeneratedFiles(prev => {
-                const existing = prev.findIndex(f => f.nombre === archivo.nombre);
-                if (existing >= 0) {
-                  const updated = [...prev];
-                  updated[existing] = newFile;
-                  return updated;
-                }
-                return [...prev, newFile];
-              });
+        try {
+          const filesResponse = await fetch('/api/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'execute',
+              steps: [{
+                accion: step.accion,
+                descripcion: step.descripcion,
+                archivos: step.archivos,
+              }],
+              ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
+              retryAttempts: { 0: 0 },
+            }),
+          });
 
-              // Actualizar terminal
-              setTerminalCommands(prev => prev.map((tc, idx) => 
-                idx === prev.length - 1 
-                  ? { ...tc, output: `${tc.output}\n📁 Archivo creado: ${archivo.nombre}` }
-                  : tc
-              ));
-            } catch (fileError) {
-              stepSuccess = false;
-              stepOutput += `\nError creando archivo: ${fileError}`;
-            }
+          const filesData = await filesResponse.json();
+          if (typeof filesData.workDir === 'string' && filesData.workDir) {
+            currentWorkDir = filesData.workDir;
+            setCurrentProjectRoot(currentWorkDir);
           }
+
+          const fileExecResult = filesData.results?.[0];
+          if (!filesResponse.ok || !filesData.success || !fileExecResult?.success) {
+            stepSuccess = false;
+            stepOutput += `
+Error creando/actualizando archivos: ${filesData.errorReport?.mensaje_error || filesData.error || 'Error desconocido'}`;
+          } else {
+            const createdFiles = step.archivos.map(a => a.nombre).join(', ');
+            stepOutput += `${stepOutput ? '\n' : ''}📁 Archivos aplicados: ${createdFiles}`;
+            setTerminalCommands(prev => prev.map((tc, idx) =>
+              idx === prev.length - 1
+                ? { ...tc, output: `${tc.output}
+📁 Archivos aplicados en disco: ${createdFiles}` }
+                : tc
+            ));
+            await refreshProjectFiles(currentWorkDir || currentProjectRoot || projectFolder);
+          }
+        } catch (fileError) {
+          stepSuccess = false;
+          stepOutput += `
+Error creando/actualizando archivos: ${fileError}`;
         }
       }
 
-      // Marcar paso como completado
+// Marcar paso como completado
       setExecutionSteps(prev => prev.map((s, idx) => 
         idx === i ? { 
           ...s, 
@@ -992,7 +1004,7 @@ ${skipOutput}`, status: "success" } : tc
     }
 
     return true;
-  }, [retryAttempts, refreshProjectFiles]);
+  }, [retryAttempts, refreshProjectFiles, currentProjectRoot, projectFolder]);
 
   const copyCode = useCallback((content: string) => {
     navigator.clipboard.writeText(content);
