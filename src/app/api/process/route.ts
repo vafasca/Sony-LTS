@@ -651,9 +651,13 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
       console.log(`[executeCommand] ℹ️ Normalizado ng new (sin rutas absolutas): ${commandToRun}; cwd=${executionCwd}`);
     }
     
-    // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
-    if (isWindows && isPowerShellCmdlet(commandToRun)) {
-      console.log('[executeCommand] Estrategia: PowerShell cmdlet');
+    // Evitar ejecutar secuencias con ';' en cmd.exe (en Windows ';' no separa comandos en CMD)
+    // y termina creando carpetas/literales no deseados como 'cd' o 'mkdir'.
+    const looksLikeSemicolonSequence = /;/.test(commandToRun);
+
+    // Verificar si es un cmdlet/script PowerShell que necesita ser envuelto
+    if (isWindows && (isPowerShellCmdlet(commandToRun) || looksLikeSemicolonSequence)) {
+      console.log('[executeCommand] Estrategia: PowerShell cmdlet/script');
       result = await runPowerShellCommand(commandToRun, executionCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
@@ -1370,6 +1374,10 @@ REGLAS:
 9. Si usas generadores CLI y ya existe RUTA BASE DEL PROYECTO, NO uses rutas absolutas en --directory; usa nombre relativo o solo nombre de proyecto
 10. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
 11. En validaciones PowerShell, usa operadores lógicos entre expresiones (ejemplo: if ((Test-Path "a") -and (Test-Path "b")) { "OK" } else { "ERROR" }); nunca uses -and como parámetro de Test-Path
+12. FASE 2 es SOLO scaffolding: crea estructura inicial (carpetas/archivos base) sin contenido funcional del negocio
+13. Si el stack tiene generadores oficiales (Angular/Nest/etc.), usa esos comandos para crear componentes/servicios y NO escribas contenido manual personalizado en FASE 2
+14. No encadenes múltiples operaciones en un mismo comando; usa pasos separados y atómicos (un comando por operación)
+15. Evita usar ';' para separar acciones en comandos de scaffolding; genera pasos independientes
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
