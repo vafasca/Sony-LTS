@@ -305,6 +305,36 @@ interface Phase3Response {
   siguiente_fase: string | null;
 }
 
+interface Phase4Response {
+  fase: string;
+  accion: string;
+  stack: string;
+  tipo_proyecto: 'con_framework' | 'sin_framework';
+  descripcion: string;
+  validaciones: Array<{
+    id: string;
+    nivel: 'build' | 'estructura' | 'funcionalidad' | 'responsividad' | 'performance';
+    nombre: string;
+    descripcion: string;
+    motivo_omision: string | null;
+    comando: string;
+    salida_esperada: string;
+    salida_error: string;
+    comparador: 'contains' | 'equals' | 'startsWith' | 'greaterThan' | 'exists';
+    critico: boolean;
+    accion_si_falla: string;
+  }>;
+  resumen_final: {
+    comando: string;
+    url: string | null;
+    salida_esperada: string;
+    salida_error: string;
+    comparador: 'contains' | 'equals' | 'startsWith';
+  };
+  progreso: string;
+  siguiente_fase: string;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ESTADO GLOBAL DE LA SESIÓN
 // ═══════════════════════════════════════════════════════════════
@@ -1431,6 +1461,98 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 }`;
 }
 
+
+function buildPhase4Prompt(
+  systemInfo: SystemInfo,
+  userObjective: string,
+  decisiones1A: Decision[],
+  estructura2: Record<string, unknown>,
+  bloquesCompletados: string[],
+  projectPath: string
+): string {
+  const decisionesStr = JSON.stringify(decisiones1A, null, 2);
+  const estructuraStr = JSON.stringify(estructura2, null, 2);
+  const bloquesStr = bloquesCompletados.length > 0 ? bloquesCompletados.join(', ') : 'Ninguno';
+
+  return `Eres un generador de validaciones para un agente automatizado.
+Tu función es generar todas las pruebas necesarias para confirmar que
+el proyecto completo funciona correctamente antes de la entrega.
+
+CONTEXTO:
+- Esta es la FASE 4 del flujo de trabajo
+- Todos los bloques del proyecto fueron desarrollados en FASE 3
+- Tu respuesta será procesada directamente por el agente, NO por un humano
+- El agente ejecutará cada validación exactamente como la indiques
+- Si una validación falla el agente disparará el prompt de error automáticamente
+- TODOS los comandos deben ser ejecutables en ${systemInfo.shell_disponible}
+
+ENTORNO DEL AGENTE:
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes: ${systemInfo.gestor_paquetes}
+
+DECISIONES TOMADAS EN FASE 1A:
+${decisionesStr}
+
+ESTRUCTURA DEL PROYECTO:
+${estructuraStr}
+
+BLOQUES DESARROLLADOS EN FASE 3:
+${bloquesStr}
+
+OBJETIVO DEL PROYECTO:
+${userObjective}
+
+RUTA DEL PROYECTO:
+${projectPath}
+
+REGLAS:
+1. TODOS los comandos deben estar escritos en sintaxis válida para ${systemInfo.shell_disponible}
+2. Genera validaciones para los 5 niveles: build, estructura, funcionalidad, responsividad y performance. Si algún nivel no aplica para el stack indicado en DECISIONES_1A, omítelo con una justificación en el campo "motivo_omision"
+3. Cada validación debe tener un comando ejecutable con salida esperada concreta y comparador. Nunca uses instrucciones para humanos como "verificar visualmente" como única validación
+4. Las validaciones deben ejecutarse en orden estricto. Si una falla las siguientes no se ejecutan hasta que se corrija
+5. Si el stack NO tiene framework (HTML puro), adapta las validaciones: verifica existencia de archivos, ausencia de links rotos y apertura correcta en navegador
+6. El campo "comando" de cada validacion debe tener comillas internas escapadas con " para garantizar JSON válido
+7. El bloque "resumen_final" debe contener un único comando que ejecute el proyecto completo y confirme que está listo para entrega
+8. No incluyas campos ni llaves fuera del esquema JSON definido
+9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "fase": "4",
+  "accion": "validacion_completa",
+  "stack": "[stack tecnologico del proyecto]",
+  "tipo_proyecto": "[con_framework | sin_framework]",
+  "descripcion": "[resumen de qué se va a validar y por qué]",
+  "validaciones": [
+    {
+      "id": "[id unico de la validacion, ej: val_01_build]",
+      "nivel": "[build | estructura | funcionalidad | responsividad | performance]",
+      "nombre": "[nombre legible de la validacion]",
+      "descripcion": "[qué se está verificando exactamente]",
+      "motivo_omision": null,
+      "comando": "[comando ejecutable en ${systemInfo.shell_disponible}]",
+      "salida_esperada": "[patron o valor que confirma que la validacion pasó]",
+      "salida_error": "[patron o valor que indica que falló]",
+      "comparador": "[contains | equals | startsWith | greaterThan | exists]",
+      "critico": true,
+      "accion_si_falla": "[descripcion de qué debe hacer el agente si esta validacion falla]"
+    }
+  ],
+  "resumen_final": {
+    "comando": "[comando en ${systemInfo.shell_disponible} que levanta el proyecto completo listo para revisión]",
+    "url": "[url donde se visualiza el proyecto completo | null si no aplica]",
+    "salida_esperada": "[patron que confirma que el proyecto está corriendo sin errores]",
+    "salida_error": "[patron que indica que algo falla al levantar]",
+    "comparador": "[contains | equals | startsWith]"
+  },
+  "progreso": "90%",
+  "siguiente_fase": "5 — Entrega"
+}`;
+}
+
 function buildErrorPrompt(systemInfo: SystemInfo, errorReport: ErrorReport): string {
   const phase1Requirements = sessionState.phase1AResult?.requisitos || [];
   const requirementChecks = Array.isArray(errorReport.entorno_adicional?.requirement_checks)
@@ -2111,6 +2233,95 @@ export async function POST(request: NextRequest) {
     }
 
     // ════════════════════════════════════════════════════════════
+    // ACCIÓN: FASE 4 - VALIDACIÓN COMPLETA
+    // ════════════════════════════════════════════════════════════
+    if (action === 'phase_4') {
+      if (!sessionState.phase1AResult || !sessionState.phase2Result) {
+        return NextResponse.json({ success: false, error: 'FASE 1A o FASE 2 no completadas' });
+      }
+
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible' });
+      }
+
+      const { sendPrompt } = browserModule;
+
+      const resolvedProjectRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = resolvedProjectRoot;
+      sessionState.projectPath = resolvedProjectRoot;
+      const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
+
+      console.log('[FASE 4] Enviando prompt de validación...');
+      const phase4Prompt = buildPhase4Prompt(
+        systemInfo,
+        message || '',
+        sessionState.phase1AResult.decisiones_tomadas,
+        realStructureSnapshot,
+        sessionState.completedBlocks,
+        resolvedProjectRoot,
+      );
+
+      const promptResult = await sendPrompt(phase4Prompt);
+      if (!promptResult.success) {
+        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      }
+
+      const phase4Result = parseJSONResponse<Phase4Response>(promptResult.response);
+      if (!phase4Result) {
+        return NextResponse.json({
+          success: false,
+          error: 'No se pudo parsear validación FASE 4',
+          rawResponse: promptResult.response.substring(0, 2000),
+          systemInfo,
+        });
+      }
+
+      const executionSteps: ExecutionStep[] = [];
+
+      phase4Result.validaciones?.forEach((val, idx) => {
+        if (!val?.comando) return;
+        executionSteps.push({
+          id: `fase4-val-${idx}`,
+          fase: '4',
+          paso: val.nombre || `Validación ${idx + 1}`,
+          accion: 'validar',
+          descripcion: val.descripcion || val.nombre || `Validación ${idx + 1}`,
+          status: 'pending',
+          comandos: [val.comando],
+          validacion: `Debe mostrar: ${val.salida_esperada || 'OK'}`,
+          tipo: val.nivel,
+        });
+      });
+
+      if (phase4Result.resumen_final?.comando) {
+        executionSteps.push({
+          id: 'fase4-resumen-final',
+          fase: '4',
+          paso: 'Resumen final de validación',
+          accion: 'validar',
+          descripcion: 'Ejecutar verificación final del proyecto listo para entrega',
+          status: 'pending',
+          comandos: [phase4Result.resumen_final.comando],
+          validacion: `Debe mostrar: ${phase4Result.resumen_final.salida_esperada || 'OK'}`,
+          tipo: 'resumen_final',
+        });
+      }
+
+      return NextResponse.json({
+        success: true,
+        fase: '4',
+        phase4Result,
+        executionSteps,
+        workDir: sessionState.currentWorkDir,
+        systemInfo,
+        rawResponse: promptResult.response,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
     // ACCIÓN: MARCAR BLOQUE COMPLETADO
     // ════════════════════════════════════════════════════════════
     if (action === 'complete_block') {
@@ -2305,6 +2516,6 @@ export async function GET() {
   return NextResponse.json({
     message: 'Sonny Agent Process API v2.1',
     phases: ['1A - Análisis', '1B - Instalación', '2 - Scaffolding', '3 - Desarrollo', '4 - Validación'],
-    actions: ['process', 'phase_1a', 'phase_2', 'phase_3', 'execute', 'report_error', 'complete_block'],
+    actions: ['process', 'phase_1a', 'phase_2', 'phase_3', 'phase_4', 'execute', 'report_error', 'complete_block'],
   });
 }
