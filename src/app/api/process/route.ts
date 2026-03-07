@@ -68,6 +68,10 @@ function cleanCommand(cmd: string): string {
   return cleaned.trim();
 }
 
+function stripAnsi(text: string): string {
+  return String(text || '').replace(/\u001B\[[0-9;]*m/g, '');
+}
+
 // ═══════════════════════════════════════════════════════════════
 // EJECUCIÓN DE COMANDOS - SIMPLE Y DIRECTO
 // ═══════════════════════════════════════════════════════════════
@@ -227,6 +231,7 @@ interface ErrorReport {
   entorno_adicional: {
     version_runtime: string | null;
     version_gestor: string | null;
+    requirement_checks?: Array<Record<string, unknown>>;
   };
 }
 
@@ -556,21 +561,48 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     
     let result;
 
-    // Normalizar scaffolding Angular cuando llega una ruta absoluta en "ng new".
-    // Angular CLI espera nombre de proyecto (no ruta absoluta) y opcionalmente --directory.
+    // Normalizar scaffolding Angular para evitar rutas absolutas en --directory.
+    // Con workDir correcto, ng new debe operar con nombre de proyecto y --directory relativo.
     const ngNewMatch = commandToRun.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
     if (ngNewMatch) {
       const targetRaw = (ngNewMatch[1] || ngNewMatch[2] || ngNewMatch[3] || '').trim();
-      const restArgs = ngNewMatch[4] || '';
-      const hasDirectoryArg = /\s--directory(?:\s|=)/i.test(restArgs);
+      let restArgs = ngNewMatch[4] || '';
 
-      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/')) && !hasDirectoryArg) {
-        const projectName = path.basename(targetRaw).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
-        const parentDir = path.dirname(targetRaw);
-        commandToRun = `ng new "${projectName}" --directory "${targetRaw}"${restArgs}`;
-        executionCwd = parentDir;
-        console.log(`[executeCommand] ℹ️ Normalizado ng new: ${commandToRun}`);
+      const sanitizeProjectName = (value: string): string =>
+        path.basename(value).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
+
+      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/'))) {
+        const projectName = sanitizeProjectName(targetRaw);
+        if (path.isAbsolute(targetRaw)) {
+          executionCwd = path.dirname(targetRaw);
+        }
+        commandToRun = `ng new "${projectName}"${restArgs}`;
+        restArgs = commandToRun.replace(/^ng\s+new\s+(?:"[^"]+"|'[^']+'|\S+)/i, '');
       }
+
+      const dirMatch = restArgs.match(/\s--directory(?:\s+|=)(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+      if (dirMatch) {
+        const originalDirToken = dirMatch[0];
+        const dirRaw = (dirMatch[1] || dirMatch[2] || dirMatch[3] || '').trim();
+        let normalizedDir = dirRaw;
+
+        if (dirRaw) {
+          normalizedDir = path.basename(dirRaw.replace(/\\/g, '/')) || dirRaw;
+          if (path.isAbsolute(dirRaw)) {
+            executionCwd = path.dirname(dirRaw);
+          }
+        }
+
+        restArgs = restArgs.replace(originalDirToken, ` --directory "${normalizedDir}"`);
+      }
+
+      if (!/^ng\s+new\s+/i.test(commandToRun)) {
+        commandToRun = `ng new "${sanitizeProjectName(targetRaw || 'app')}"${restArgs}`;
+      } else {
+        commandToRun = commandToRun.replace(/^(ng\s+new\s+(?:"[^"]+"|'[^']+'|\S+)).*$/i, `$1${restArgs}`);
+      }
+
+      console.log(`[executeCommand] ℹ️ Normalizado ng new (sin rutas absolutas): ${commandToRun}; cwd=${executionCwd}`);
     }
     
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
@@ -600,11 +632,196 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   }
 }
 
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeProjectRelativePath(inputPath: string): string {
+  const normalizedInput = String(inputPath || '').trim().replace(/\\/g, '/');
+  if (!normalizedInput) return normalizedInput;
+
+  if (path.isAbsolute(normalizedInput)) {
+    return normalizedInput;
+  }
+
+  // Si la IA devuelve prefijos redundantes (workspace/proyecto/.../src/app/file),
+  // recortamos al segmento de proyecto para escribir en el cwd correcto.
+  const keepFromMarkers = ['src/', 'public/', '.vscode/', 'assets/'];
+  for (const marker of keepFromMarkers) {
+    const markerIndex = normalizedInput.indexOf(marker);
+    if (markerIndex > 0) {
+      return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+    }
+  }
+
+  // Archivos típicos de raíz del proyecto Angular.
+  const rootFiles = [
+    'angular.json',
+    'package.json',
+    'package-lock.json',
+    'README.md',
+    'tsconfig.json',
+    'tsconfig.app.json',
+    'tsconfig.spec.json',
+    '.gitignore',
+    '.editorconfig',
+    '.prettierrc',
+  ];
+  for (const rootFile of rootFiles) {
+    const suffix = `/${rootFile}`;
+    if (normalizedInput.endsWith(suffix)) {
+      return rootFile;
+    }
+  }
+
+  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
+  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
+    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
+  }
+
+  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
+  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
+    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
+  }
+
+  return normalizedInput;
+}
+
+
+async function resolveProjectRootPath(): Promise<string> {
+  const candidates: string[] = [];
+
+  const addCandidate = (candidate?: string | null) => {
+    if (!candidate) return;
+    const trimmed = String(candidate).trim();
+    if (!trimmed) return;
+    if (!candidates.includes(trimmed)) {
+      candidates.push(trimmed);
+    }
+  };
+
+  const phase2ProjectName = sessionState.phase2Result?.nombre_proyecto;
+
+  // Prioridad alta: ruta concreta del proyecto generado en FASE 2.
+  if (phase2ProjectName) {
+    addCandidate(sessionState.projectPath ? path.join(sessionState.projectPath, phase2ProjectName) : null);
+    addCandidate(sessionState.currentWorkDir ? path.join(sessionState.currentWorkDir, phase2ProjectName) : null);
+    addCandidate(path.join(process.cwd(), phase2ProjectName));
+  }
+
+  // Prioridad media: ubicaciones de sesión.
+  addCandidate(sessionState.projectPath);
+  addCandidate(sessionState.currentWorkDir);
+
+  // Fallback: cwd del proceso.
+  addCandidate(process.cwd());
+
+  let bestCandidate: string | null = null;
+  let bestScore = -1;
+
+  for (const candidate of candidates) {
+    const angularJson = path.join(candidate, 'angular.json');
+    const packageJson = path.join(candidate, 'package.json');
+    const srcDir = path.join(candidate, 'src');
+
+    const hasAngular = await pathExists(angularJson);
+    const hasPackage = await pathExists(packageJson);
+    const hasSrc = await pathExists(srcDir);
+
+    const score = hasAngular ? 3 : (hasPackage && hasSrc ? 2 : (hasPackage || hasSrc ? 1 : 0));
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = candidate;
+      if (score === 3) break;
+    }
+  }
+
+  return bestCandidate || sessionState.currentWorkDir || sessionState.projectPath || process.cwd();
+}
+
+
+async function buildProjectStructureSnapshot(rootPath: string): Promise<Record<string, unknown>> {
+  const maxEntries = 250;
+  let entryCount = 0;
+  let totalFiles = 0;
+  let totalDirectories = 0;
+  let truncated = false;
+
+  const entriesList: string[] = [];
+  const ignored = new Set([
+    'node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out',
+    '.angular', '.cache', 'tmp', 'temp'
+  ]);
+
+  const walk = async (absDir: string, relDir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await fs.readdir(absDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    entries.sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    });
+
+    for (const entry of entries) {
+      if (ignored.has(entry.name)) continue;
+      const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
+      const absPath = path.join(absDir, entry.name);
+
+      if (entry.isDirectory()) {
+        totalDirectories++;
+        if (entryCount < maxEntries) {
+          entriesList.push(relPath);
+          entryCount++;
+        } else {
+          truncated = true;
+        }
+        await walk(absPath, relPath);
+      } else if (entry.isFile()) {
+        totalFiles++;
+        if (entryCount < maxEntries) {
+          entriesList.push(relPath);
+          entryCount++;
+        } else {
+          truncated = true;
+        }
+      }
+    }
+  };
+
+  await walk(rootPath, '');
+
+  return {
+    tipo: 'listado_rutas_relativas',
+    raiz: rootPath,
+    paths: entriesList,
+    resumen: {
+      archivos: totalFiles,
+      directorios: totalDirectories,
+      entradas_mostradas: entriesList.length,
+      truncado: truncated,
+    },
+    nota: 'Snapshot compacto para FASE 3: solo rutas relativas visibles (sin contenido de archivos).',
+  };
+}
+
 async function createFile(nombre: string, contenido: string): Promise<{ success: boolean; message: string }> {
   console.log(`[createFile] Creando: ${nombre}`);
   
   try {
-    const filePath = path.isAbsolute(nombre) ? nombre : path.join(sessionState.currentWorkDir, nombre);
+    const normalizedTarget = normalizeProjectRelativePath(nombre);
+    const filePath = path.isAbsolute(normalizedTarget) ? normalizedTarget : path.join(sessionState.currentWorkDir, normalizedTarget);
     const dir = path.dirname(filePath);
     
     // Crear directorios si no existen
@@ -707,12 +924,72 @@ function parseJSONResponse<T>(response: string): T | null {
     .replace(/[‘’]/g, "'")
     .trim();
 
-  const tryParse = (raw: string): T | null => {
-    const clean = normalize(raw)
+  const escapeUnescapedQuotesInFieldValues = (input: string, fieldNames: string[]): string => {
+    let text = input;
+
+    for (const field of fieldNames) {
+      const fieldPattern = new RegExp(`"${field}"\\s*:\\s*"`, 'g');
+      let match: RegExpExecArray | null;
+
+      while ((match = fieldPattern.exec(text)) !== null) {
+        const valueStart = match.index + match[0].length;
+        let i = valueStart;
+        let repaired = '';
+
+        while (i < text.length) {
+          const ch = text[i];
+
+          if (ch === '"' && text[i - 1] !== '\\') {
+            const tail = text.slice(i + 1);
+            const nextNonSpace = tail.match(/^\s*/)?.[0].length ?? 0;
+            const token = tail[nextNonSpace] || '';
+            if (token === ',' || token === '}' || token === ']') {
+              break;
+            }
+            repaired += '\\"';
+            i++;
+            continue;
+          }
+
+          repaired += ch;
+          i++;
+        }
+
+        if (i >= text.length) break;
+
+        text = `${text.slice(0, valueStart)}${repaired}${text.slice(i)}`;
+        fieldPattern.lastIndex = valueStart + repaired.length + 1;
+      }
+    }
+
+    return text;
+  };
+
+  const repairCommonJsonIssues = (raw: string): string => {
+    const noFences = normalize(raw)
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i, '')
       .replace(/```$/i, '')
       .trim();
+
+    const escapedFieldValues = escapeUnescapedQuotesInFieldValues(noFences, [
+      'contenido',
+      'comando',
+      'instruccion',
+      'descripcion',
+      'mensaje',
+      'razon',
+      'justificacion',
+      'causa_raiz',
+    ]);
+
+    return escapedFieldValues
+      .replace(/,\s*([}\]])/g, '$1')
+      .trim();
+  };
+
+  const tryParse = (raw: string): T | null => {
+    const clean = repairCommonJsonIssues(raw);
 
     try {
       return JSON.parse(clean) as T;
@@ -785,6 +1062,7 @@ function parseJSONResponse<T>(response: string): T | null {
 
   return null;
 }
+
 
 function parseInterpretation(response: string): { tipo: string; descripcion: string; necesita_ia_web: boolean } | null {
   try {
@@ -955,7 +1233,8 @@ REGLAS:
 6. Los comandos de creación deben ser atómicos: un comando por carpeta o archivo
 7. Todos los strings con comillas internas deben escaparse con \\"
 8. El bloque de validacion debe contener un comando ejecutable que confirme la estructura
-9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+9. Si usas generadores CLI y ya existe RUTA BASE DEL PROYECTO, NO uses rutas absolutas en --directory; usa nombre relativo o solo nombre de proyecto
+10. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1022,7 +1301,7 @@ ENTORNO DEL AGENTE:
 DECISIONES TOMADAS EN FASE 1A:
 ${decisionesStr}
 
-ESTRUCTURA CREADA EN FASE 2:
+ESTRUCTURA CREADA EN FASE 2 (solo rutas visibles, sin contenido):
 ${estructuraStr}
 
 OBJETIVO DEL PROYECTO:
@@ -1045,8 +1324,14 @@ REGLAS:
 5. El comando de previsualización debe permitir verificar que el bloque funciona
 6. La validación debe ser un comando ejecutable con salida esperada concreta
 7. Si el stack tiene servidor de desarrollo, el comando debe iniciarlo
-8. El campo "bloques_pendientes" debe listar todos los bloques que faltan
-9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+8. Todos los strings con comillas internas deben escaparse con \" para garantizar JSON válido
+9. El campo "bloques_pendientes" debe listar todos los bloques que faltan después del actual
+10. No incluyas campos ni llaves fuera del esquema JSON definido
+11. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
+12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \" (ejemplo: \"texto\")
+13. No uses markdown (sin enlaces tipo [texto](url), sin bloques fenced), solo strings JSON puros
+14. Si incluyes comandos PowerShell con rutas, usa comillas escapadas válidas dentro del JSON
+15. No encadenes múltiples objetos JSON en una sola respuesta; devuelve exactamente UN objeto raíz
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1058,7 +1343,7 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
   "archivos": [{ "ruta": "[ruta relativa]", "operacion": "[crear | modificar]", "descripcion": "[para qué sirve]", "contenido": "[contenido completo]" }],
   "comandos_post_escritura": [{ "orden": 1, "descripcion": "[qué hace]", "comando": "[comando ejecutable]", "continuar_si_falla": false }],
   "previsualizacion": { "comando": "[comando para iniciar servidor/abrir]", "url": "[url | null]", "instruccion": "[qué verificar visualmente]" },
-  "validacion": { "comando": "[comando que confirma éxito]", "salida_esperada": "[patrón]", "salida_error": "[patrón error]", "comparador": "[contains | equals | startsWith]" },
+  "validacion": { "comando": "[comando que confirma éxito]", "salida_esperada": "[patrón]", "salida_error": "[patrón error]", "comparador": "[contains | equals | startsWith | greaterThan]" },
   "bloques_pendientes": [{ "id": "[id]", "nombre": "[nombre]", "depende_de": ["[ids]"] }],
   "progreso": "[porcentaje]",
   "siguiente_bloque": "[id siguiente | null si último]",
@@ -1067,6 +1352,29 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 }
 
 function buildErrorPrompt(systemInfo: SystemInfo, errorReport: ErrorReport): string {
+  const phase1Requirements = sessionState.phase1AResult?.requisitos || [];
+  const requirementChecks = Array.isArray(errorReport.entorno_adicional?.requirement_checks)
+    ? errorReport.entorno_adicional.requirement_checks
+    : [];
+
+  const requirementSummary = phase1Requirements.length > 0
+    ? phase1Requirements.map((req, idx) => {
+      const check = requirementChecks.find((entry: Record<string, unknown>) =>
+        String(entry.nombre || '').toLowerCase() === String(req.nombre || '').toLowerCase()
+      ) as Record<string, unknown> | undefined;
+
+      const detectedState = check?.status ? String(check.status) : 'UNKNOWN';
+      const detectedValue = check?.output ? String(check.output) : 'Sin verificación ejecutada';
+
+      return `${idx + 1}. ${req.nombre}
+   - versión mínima: ${req.version_minima ?? 'n/a'}
+   - versión recomendada: ${req.version_recomendada ?? 'n/a'}
+   - expected marker: ${req.salida_esperada ?? 'OK'}
+   - estado detectado: ${detectedState}
+   - salida detectada: ${detectedValue}`;
+    }).join('\n')
+    : 'No hay requisitos de FASE 1A registrados en sesión.';
+
   return `Eres un solucionador de errores para un agente automatizado.
 Tu función es analizar el error reportado y devolver una solución ejecutable.
 
@@ -1084,6 +1392,14 @@ ENTORNO DEL AGENTE:
 
 ERROR REPORTADO:
 ${JSON.stringify(errorReport, null, 2)}
+
+REQUISITOS VALIDADOS (FASE 1A):
+${requirementSummary}
+
+INSTRUCCIONES DE CORRECCIÓN:
+- Usa los requisitos validados para escoger comandos compatibles con versiones reales.
+- Si detectas stack Angular standalone, evita asumir NgModule tradicional y usa flags como --standalone o --skip-import cuando aplique.
+- Prioriza soluciones idempotentes y seguras para reintento automático.
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1227,7 +1543,7 @@ export async function POST(request: NextRequest) {
                 ? step.validacion.replace(/^Debe mostrar:\s*/i, '').trim()
                 : '';
               const expected = expectedRaw || 'OK';
-              const outputUpper = String(cmdResult.output || '').toUpperCase();
+              const outputUpper = stripAnsi(String(cmdResult.output || '')).toUpperCase();
               const hasKnownMarker = outputUpper.includes('OK-') || outputUpper.includes('OUT_OF_RANGE-') || outputUpper.includes('MISSING');
 
               // Para verificaciones, no depender solo del exit code.
@@ -1635,13 +1951,18 @@ export async function POST(request: NextRequest) {
 
       const { sendPrompt } = browserModule;
       
+      const resolvedProjectRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = resolvedProjectRoot;
+      sessionState.projectPath = resolvedProjectRoot;
+      const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
+
       console.log('[FASE 3] Enviando prompt de desarrollo...');
       const phase3Prompt = buildPhase3Prompt(
         systemInfo, 
         message || '', 
         sessionState.phase1AResult.decisiones_tomadas,
-        sessionState.phase2Result.estructura_esperada,
-        sessionState.projectPath || sessionState.currentWorkDir,
+        realStructureSnapshot,
+        resolvedProjectRoot,
         bloqueActual || null,
         sessionState.completedBlocks
       );
@@ -1703,6 +2024,7 @@ export async function POST(request: NextRequest) {
         progreso: phase3Result.progreso,
         siguienteBloque: phase3Result.siguiente_bloque,
         siguienteFase: phase3Result.siguiente_fase,
+        workDir: sessionState.currentWorkDir,
         systemInfo,
         rawResponse: promptResult.response,
       });

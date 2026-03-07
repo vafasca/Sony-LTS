@@ -230,6 +230,7 @@ export default function SonnyAgent() {
   
   // Project Folder
   const [projectFolder, setProjectFolder] = useState("");
+  const [currentProjectRoot, setCurrentProjectRoot] = useState("");
   const [savedProjects, setSavedProjects] = useState<Project[]>([]);
   
   // Connection Status
@@ -354,7 +355,7 @@ export default function SonnyAgent() {
       setActiveTab('code');
     }
   }, []);
-;
+
   
   // Browse folder dialog
   const browseFolder = useCallback(async () => {
@@ -363,6 +364,7 @@ export default function SonnyAgent() {
       const data = await response.json();
       if (data.success && data.path) {
         setProjectFolder(data.path);
+        setCurrentProjectRoot(data.path);
         fetchSystemInfo(data.path);
       }
     } catch (error) {
@@ -382,6 +384,7 @@ export default function SonnyAgent() {
     setSystemPrompt(savedPrompt);
     setSelectedAI(savedAI);
     setProjectFolder(savedFolder);
+    setCurrentProjectRoot(savedFolder);
     
     try {
       setSavedProjects(JSON.parse(savedProjectsData));
@@ -587,19 +590,96 @@ export default function SonnyAgent() {
       // FASE 2: Ejecutar pasos con streaming en tiempo real
       if (steps.length > 0) {
         const workDir = typeof data.workDir === "string" ? data.workDir : "";
-        if (workDir) await refreshProjectFiles(workDir);
+        if (workDir) {
+          setCurrentProjectRoot(workDir);
+          await refreshProjectFiles(workDir);
+        }
         const success = await executeWithStreaming(steps, workDir);
         
         // Obtener conteo del estado actual
         setExecutionSteps(prev => {
           const successCount = prev.filter(s => s.status === "success").length;
           if (success) {
-            updateMessage(statusMsgId, `✅ Proceso completado. ${successCount}/${steps.length} pasos exitosos.`, "success");
+            updateMessage(statusMsgId, `✅ Fases 1/2 completadas. ${successCount}/${steps.length} pasos exitosos.`, "success");
           } else {
             updateMessage(statusMsgId, `⚠️ Proceso completado con errores. ${successCount}/${steps.length} pasos exitosos.`, "error");
           }
           return prev;
         });
+
+        if (success) {
+          updateMessage(statusMsgId, '🧩 Iniciando FASE 3 por bloques...');
+          let blockId: string | null = null;
+          const maxBlocks = 20;
+
+          for (let round = 0; round < maxBlocks; round++) {
+            const phase3Response = await fetch('/api/process', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'phase_3',
+                message: input,
+                aiProvider: selectedAI,
+                groqApiKey,
+                bloqueActual: blockId,
+                projectFolder,
+              }),
+            });
+
+            const phase3Data = await phase3Response.json();
+            if (!phase3Response.ok || !phase3Data.success) {
+              updateMessage(statusMsgId, `⚠️ FASE 3 detenida: ${phase3Data.error || 'Error desconocido'}`, 'error');
+              break;
+            }
+
+            const phase3Steps: ExecutionStep[] = (phase3Data.executionSteps || []).map((step: Record<string, unknown>, index: number) => ({
+              id: `fase3-step-${round}-${index}`,
+              numero: index + 1,
+              fase: (step.fase as string) || '3',
+              accion: (step.accion as ExecutionStep['accion']) || 'crear',
+              descripcion: (step.descripcion as string) || '',
+              status: 'pending' as const,
+              comandos: (step.comandos as string[]) || [],
+              archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
+              validacion: (step.validacion as string) || '',
+            }));
+
+            setExecutionSteps(phase3Steps);
+            const blockOk = await executeWithStreaming(phase3Steps, currentProjectRoot || workDir);
+            if (!blockOk) {
+              updateMessage(statusMsgId, '❌ FASE 3 detenida por error en bloque', 'error');
+              break;
+            }
+
+            const completeResponse = await fetch('/api/process', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'complete_block', projectFolder }),
+            });
+            const completeData = await completeResponse.json();
+            if (completeData?.pendingBlocks && Array.isArray(completeData.pendingBlocks)) {
+              // continuar según siguiente bloque de IA
+            }
+
+            if (phase3Data.phase3Result?.siguiente_bloque) {
+              blockId = String(phase3Data.phase3Result.siguiente_bloque);
+            } else {
+              blockId = null;
+            }
+
+            const maybeWorkDir = typeof phase3Data.workDir === 'string' ? phase3Data.workDir : '';
+            if (maybeWorkDir) {
+              setCurrentProjectRoot(maybeWorkDir);
+              await refreshProjectFiles(maybeWorkDir);
+            }
+
+            const nextPhase = String(phase3Data.phase3Result?.siguiente_fase || '').toLowerCase();
+            if (nextPhase.includes('4') || blockId === null) {
+              updateMessage(statusMsgId, '✅ FASE 3 completada. Listo para FASE 4.', 'success');
+              break;
+            }
+          }
+        }
       } else {
         updateMessage(statusMsgId, `✅ Sin pasos que ejecutar.`, "success");
       }
@@ -610,7 +690,7 @@ export default function SonnyAgent() {
     } finally {
       setIsProcessing(false);
     }
-  }, [input, isProcessing, osInfo, selectedAI, groqApiKey, projectFolder, addMessage, updateMessage, refreshProjectFiles]);
+  }, [input, isProcessing, osInfo, selectedAI, groqApiKey, projectFolder, currentProjectRoot, addMessage, updateMessage, refreshProjectFiles]);
 
   const stopProcess = useCallback(() => {
     setIsProcessing(false);
@@ -622,6 +702,7 @@ export default function SonnyAgent() {
     let currentWorkDir = workDir;
     const totalSteps = steps.length;
     const requirementStatus: Record<string, { verified: boolean; output: string; expected: string; metExpectation: boolean }> = {};
+    const maxFixAttempts = 3;
 
     const evaluateVerificationExpectation = (output: string, expected: string, success: boolean): boolean => {
       if (!success) return false;
@@ -660,6 +741,28 @@ export default function SonnyAgent() {
 
       return outputUpper.includes(expectedUpper);
     };
+
+    const buildStepPayload = (targetStep: ExecutionStep, cmd?: string) => ({
+      id: targetStep.id,
+      fase: targetStep.fase,
+      paso: targetStep.descripcion,
+      accion: targetStep.accion,
+      descripcion: targetStep.descripcion,
+      validacion: targetStep.validacion,
+      requisito_origen: targetStep.requisito_origen,
+      ...(cmd
+        ? { comandos: [cmd] }
+        : (targetStep.comandos && targetStep.comandos.length > 0 ? { comandos: targetStep.comandos } : {})),
+      ...(targetStep.archivos && targetStep.archivos.length > 0 ? { archivos: targetStep.archivos } : {}),
+    });
+
+    const collectRequirementSnapshot = () =>
+      Object.entries(requirementStatus).map(([name, status]) => ({
+        nombre: name,
+        expected: status.expected || 'OK',
+        output: status.output,
+        status: status.metExpectation ? 'OK' : (status.output.toUpperCase().includes('MISSING') ? 'MISSING' : 'OUT_OF_RANGE'),
+      }));
     
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
@@ -717,11 +820,7 @@ ${skipOutput}`, status: "success" } : tc
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   action: "execute",
-                  steps: [{
-                    accion: step.accion,
-                    descripcion: step.descripcion,
-                    comandos: [cmd],
-                  }],
+                  steps: [buildStepPayload(step, cmd)],
                   ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
                   retryAttempts: { 0: localRetryAttempts[i] || 0 },
                 }),
@@ -730,6 +829,7 @@ ${skipOutput}`, status: "success" } : tc
               const execData = await execResponse.json();
               if (typeof execData.workDir === 'string' && execData.workDir) {
                 currentWorkDir = execData.workDir;
+                setCurrentProjectRoot(currentWorkDir);
                 await refreshProjectFiles(currentWorkDir);
               }
 
@@ -758,6 +858,158 @@ ${skipOutput}`, status: "success" } : tc
                 
                 // Si alcanzó máximo de reintentos, mostrar diálogo
                 if (execData.maxRetriesReached) {
+                  let autoFixApplied = false;
+
+                  for (let fixAttempt = 1; fixAttempt <= maxFixAttempts; fixAttempt++) {
+                    setTerminalCommands(prev => prev.map((tc, idx) =>
+                      idx === prev.length - 1
+                        ? {
+                          ...tc,
+                          output: `${tc.output}\n🤖 Resolviendo error con IA (intento ${fixAttempt}/${maxFixAttempts})...`,
+                        }
+                        : tc
+                    ));
+
+                    setExecutionSteps(prev => prev.map((s, idx) =>
+                      idx === i
+                        ? { ...s, output: `${s.output || ''}\n🤖 Intento de corrección IA ${fixAttempt}/${maxFixAttempts}...` }
+                        : s
+                    ));
+
+                    try {
+                      const reportResponse = await fetch('/api/process', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          action: 'report_error',
+                          aiProvider: selectedAI,
+                          errorReport: {
+                            ...(execData.errorReport || {}),
+                            fase: execData.errorReport?.fase || step.fase || `Paso ${stepNumber}`,
+                            paso: execData.errorReport?.paso || step.descripcion,
+                            accion_ejecutada: cmd,
+                            estructura_proyecto: {
+                              ...(execData.errorReport?.estructura_proyecto || {}),
+                              workDir: currentWorkDir,
+                            },
+                            entorno_adicional: {
+                              ...(execData.errorReport?.entorno_adicional || {}),
+                              requirement_checks: collectRequirementSnapshot(),
+                            },
+                          },
+                        }),
+                      });
+
+                      const reportData = await reportResponse.json();
+                      const solution = reportData.solution;
+                      const fixCommands = Array.isArray(solution?.comandos)
+                        ? solution.comandos
+                          .map((entry: string | { comando?: string }) =>
+                            typeof entry === 'string' ? entry : entry?.comando
+                          )
+                          .filter((value: string | undefined): value is string => Boolean(value))
+                        : [];
+                      const fixFiles = Array.isArray(solution?.archivos)
+                        ? solution.archivos.map((entry: { ruta?: string; nombre?: string; contenido?: string | null }) => ({
+                          nombre: entry?.ruta || entry?.nombre,
+                          contenido: entry?.contenido || '',
+                        })).filter((entry: { nombre?: string }) => Boolean(entry.nombre))
+                        : [];
+
+                      if (!reportResponse.ok || !reportData.success || (!fixCommands.length && !fixFiles.length)) {
+                        setTerminalCommands(prev => prev.map((tc, idx) =>
+                          idx === prev.length - 1
+                            ? {
+                              ...tc,
+                              output: `${tc.output}\n⚠️ Corrección IA ${fixAttempt}/${maxFixAttempts} sin cambios aplicables.`,
+                            }
+                            : tc
+                        ));
+                        continue;
+                      }
+
+                      const fixStep: ExecutionStep = {
+                        ...step,
+                        id: `${step.id}-fix-${fixAttempt}`,
+                        accion: 'corregir',
+                        descripcion: solution?.paso || `Corrección automática para ${step.descripcion}`,
+                        comandos: fixCommands,
+                        archivos: fixFiles,
+                        status: 'running',
+                      };
+
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}
+🛠️ Aplicando corrección IA ${fixAttempt}/${maxFixAttempts}: ${fixCommands.join(' && ') || 'sin comandos'}`,
+                            status: 'running',
+                          }
+                          : tc
+                      ));
+
+                      const fixResponse = await fetch('/api/process', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          action: 'execute',
+                          steps: [buildStepPayload(fixStep)],
+                          ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
+                          retryAttempts: { 0: 0 },
+                        }),
+                      });
+
+                      const fixData = await fixResponse.json();
+                      if (typeof fixData.workDir === 'string' && fixData.workDir) {
+                        currentWorkDir = fixData.workDir;
+                        setCurrentProjectRoot(currentWorkDir);
+                      }
+
+                      const fixOk = fixResponse.ok && fixData.success && fixData.results?.[0]?.success;
+                      if (fixOk) {
+                        autoFixApplied = true;
+                        await refreshProjectFiles(currentWorkDir || currentProjectRoot || projectFolder);
+                        localRetryAttempts = { ...localRetryAttempts, [i]: 0 };
+                        setRetryAttempts(localRetryAttempts);
+
+                        setTerminalCommands(prev => prev.map((tc, idx) =>
+                          idx === prev.length - 1
+                            ? {
+                              ...tc,
+                              output: `${tc.output}\n✅ Corrección IA aplicada. Reintentando paso original...`,
+                              status: 'running',
+                            }
+                            : tc
+                        ));
+                        break;
+                      }
+
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}\n⚠️ Corrección IA ${fixAttempt}/${maxFixAttempts} falló: ${fixData.errorReport?.mensaje_error || fixData.error || 'error desconocido'}`,
+                          }
+                          : tc
+                      ));
+                    } catch (autoFixError) {
+                      setTerminalCommands(prev => prev.map((tc, idx) =>
+                        idx === prev.length - 1
+                          ? {
+                            ...tc,
+                            output: `${tc.output}\n⚠️ Error ejecutando corrección IA ${fixAttempt}/${maxFixAttempts}: ${autoFixError}`,
+                          }
+                          : tc
+                      ));
+                    }
+                  }
+
+                  if (autoFixApplied) {
+                    await new Promise(resolve => setTimeout(resolve, 800));
+                    continue;
+                  }
+
                   setCurrentError({
                     stepIndex: i,
                     fase: execData.errorReport?.fase || step.fase || `Paso ${stepNumber}`,
@@ -860,42 +1112,50 @@ ${skipOutput}`, status: "success" } : tc
         }
       }
 
-      // Crear archivos del paso
+            // Crear/editar archivos del paso en disco (backend), no solo en estado local
       if (stepSuccess && step.archivos && step.archivos.length > 0) {
-        for (const archivo of step.archivos) {
-          if (archivo.contenido) {
-            try {
-              // Agregar archivo a la lista de generados
-              const newFile: GeneratedFile = {
-                nombre: archivo.nombre,
-                ruta: archivo.nombre,
-                contenido: archivo.contenido,
-              };
-              setGeneratedFiles(prev => {
-                const existing = prev.findIndex(f => f.nombre === archivo.nombre);
-                if (existing >= 0) {
-                  const updated = [...prev];
-                  updated[existing] = newFile;
-                  return updated;
-                }
-                return [...prev, newFile];
-              });
+        try {
+          const filesResponse = await fetch('/api/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'execute',
+              steps: [buildStepPayload(step)],
+              ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
+              retryAttempts: { 0: 0 },
+            }),
+          });
 
-              // Actualizar terminal
-              setTerminalCommands(prev => prev.map((tc, idx) => 
-                idx === prev.length - 1 
-                  ? { ...tc, output: `${tc.output}\n📁 Archivo creado: ${archivo.nombre}` }
-                  : tc
-              ));
-            } catch (fileError) {
-              stepSuccess = false;
-              stepOutput += `\nError creando archivo: ${fileError}`;
-            }
+          const filesData = await filesResponse.json();
+          if (typeof filesData.workDir === 'string' && filesData.workDir) {
+            currentWorkDir = filesData.workDir;
+            setCurrentProjectRoot(currentWorkDir);
           }
+
+          const fileExecResult = filesData.results?.[0];
+          if (!filesResponse.ok || !filesData.success || !fileExecResult?.success) {
+            stepSuccess = false;
+            stepOutput += `
+Error creando/actualizando archivos: ${filesData.errorReport?.mensaje_error || filesData.error || 'Error desconocido'}`;
+          } else {
+            const createdFiles = step.archivos.map(a => a.nombre).join(', ');
+            stepOutput += `${stepOutput ? '\n' : ''}📁 Archivos aplicados: ${createdFiles}`;
+            setTerminalCommands(prev => prev.map((tc, idx) =>
+              idx === prev.length - 1
+                ? { ...tc, output: `${tc.output}
+📁 Archivos aplicados en disco: ${createdFiles}` }
+                : tc
+            ));
+            await refreshProjectFiles(currentWorkDir || currentProjectRoot || projectFolder);
+          }
+        } catch (fileError) {
+          stepSuccess = false;
+          stepOutput += `
+Error creando/actualizando archivos: ${fileError}`;
         }
       }
 
-      // Marcar paso como completado
+// Marcar paso como completado
       setExecutionSteps(prev => prev.map((s, idx) => 
         idx === i ? { 
           ...s, 
@@ -911,7 +1171,7 @@ ${skipOutput}`, status: "success" } : tc
     }
 
     return true;
-  }, [retryAttempts, refreshProjectFiles]);
+  }, [retryAttempts, refreshProjectFiles, currentProjectRoot, projectFolder, selectedAI]);
 
   const copyCode = useCallback((content: string) => {
     navigator.clipboard.writeText(content);
@@ -1333,7 +1593,7 @@ ${skipOutput}`, status: "success" } : tc
                   {generatedFiles.length > 0 ? (
                     <div className="space-y-1">
                       {generatedFiles.map((file, index) => (
-                        <button key={index} onClick={() => loadFileContent(file, projectFolder)} className={`flex items-center gap-2 w-full px-2 py-1.5 hover:bg-slate-700 rounded text-left text-sm ${activeFile?.nombre === file.nombre ? "bg-slate-700" : ""}`}>
+                        <button key={index} onClick={() => loadFileContent(file, currentProjectRoot || projectFolder)} className={`flex items-center gap-2 w-full px-2 py-1.5 hover:bg-slate-700 rounded text-left text-sm ${activeFile?.nombre === file.nombre ? "bg-slate-700" : ""}`}>
                           {file.tipo === 'directory' ? <FolderTree className="h-4 w-4 text-yellow-400" /> : <FileCode className="h-4 w-4 text-blue-400" />}
                           <span>{file.nombre}</span>
                         </button>
