@@ -68,6 +68,10 @@ function cleanCommand(cmd: string): string {
   return cleaned.trim();
 }
 
+function stripAnsi(text: string): string {
+  return String(text || '').replace(/\u001B\[[0-9;]*m/g, '');
+}
+
 // ═══════════════════════════════════════════════════════════════
 // EJECUCIÓN DE COMANDOS - SIMPLE Y DIRECTO
 // ═══════════════════════════════════════════════════════════════
@@ -557,21 +561,48 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     
     let result;
 
-    // Normalizar scaffolding Angular cuando llega una ruta absoluta en "ng new".
-    // Angular CLI espera nombre de proyecto (no ruta absoluta) y opcionalmente --directory.
+    // Normalizar scaffolding Angular para evitar rutas absolutas en --directory.
+    // Con workDir correcto, ng new debe operar con nombre de proyecto y --directory relativo.
     const ngNewMatch = commandToRun.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
     if (ngNewMatch) {
       const targetRaw = (ngNewMatch[1] || ngNewMatch[2] || ngNewMatch[3] || '').trim();
-      const restArgs = ngNewMatch[4] || '';
-      const hasDirectoryArg = /\s--directory(?:\s|=)/i.test(restArgs);
+      let restArgs = ngNewMatch[4] || '';
 
-      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/')) && !hasDirectoryArg) {
-        const projectName = path.basename(targetRaw).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
-        const parentDir = path.dirname(targetRaw);
-        commandToRun = `ng new "${projectName}" --directory "${targetRaw}"${restArgs}`;
-        executionCwd = parentDir;
-        console.log(`[executeCommand] ℹ️ Normalizado ng new: ${commandToRun}`);
+      const sanitizeProjectName = (value: string): string =>
+        path.basename(value).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
+
+      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/'))) {
+        const projectName = sanitizeProjectName(targetRaw);
+        if (path.isAbsolute(targetRaw)) {
+          executionCwd = path.dirname(targetRaw);
+        }
+        commandToRun = `ng new "${projectName}"${restArgs}`;
+        restArgs = commandToRun.replace(/^ng\s+new\s+(?:"[^"]+"|'[^']+'|\S+)/i, '');
       }
+
+      const dirMatch = restArgs.match(/\s--directory(?:\s+|=)(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+      if (dirMatch) {
+        const originalDirToken = dirMatch[0];
+        const dirRaw = (dirMatch[1] || dirMatch[2] || dirMatch[3] || '').trim();
+        let normalizedDir = dirRaw;
+
+        if (dirRaw) {
+          normalizedDir = path.basename(dirRaw.replace(/\\/g, '/')) || dirRaw;
+          if (path.isAbsolute(dirRaw)) {
+            executionCwd = path.dirname(dirRaw);
+          }
+        }
+
+        restArgs = restArgs.replace(originalDirToken, ` --directory "${normalizedDir}"`);
+      }
+
+      if (!/^ng\s+new\s+/i.test(commandToRun)) {
+        commandToRun = `ng new "${sanitizeProjectName(targetRaw || 'app')}"${restArgs}`;
+      } else {
+        commandToRun = commandToRun.replace(/^(ng\s+new\s+(?:"[^"]+"|'[^']+'|\S+)).*$/i, `$1${restArgs}`);
+      }
+
+      console.log(`[executeCommand] ℹ️ Normalizado ng new (sin rutas absolutas): ${commandToRun}; cwd=${executionCwd}`);
     }
     
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
@@ -1202,7 +1233,8 @@ REGLAS:
 6. Los comandos de creación deben ser atómicos: un comando por carpeta o archivo
 7. Todos los strings con comillas internas deben escaparse con \\"
 8. El bloque de validacion debe contener un comando ejecutable que confirme la estructura
-9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+9. Si usas generadores CLI y ya existe RUTA BASE DEL PROYECTO, NO uses rutas absolutas en --directory; usa nombre relativo o solo nombre de proyecto
+10. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1511,7 +1543,7 @@ export async function POST(request: NextRequest) {
                 ? step.validacion.replace(/^Debe mostrar:\s*/i, '').trim()
                 : '';
               const expected = expectedRaw || 'OK';
-              const outputUpper = String(cmdResult.output || '').toUpperCase();
+              const outputUpper = stripAnsi(String(cmdResult.output || '')).toUpperCase();
               const hasKnownMarker = outputUpper.includes('OK-') || outputUpper.includes('OUT_OF_RANGE-') || outputUpper.includes('MISSING');
 
               // Para verificaciones, no depender solo del exit code.
