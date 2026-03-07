@@ -633,25 +633,57 @@ function normalizeProjectRelativePath(inputPath: string): string {
 }
 
 async function resolveProjectRootPath(): Promise<string> {
-  const candidates = new Set<string>();
-  if (sessionState.currentWorkDir) candidates.add(sessionState.currentWorkDir);
-  if (sessionState.projectPath) candidates.add(sessionState.projectPath);
-  if (sessionState.projectPath && sessionState.phase2Result?.nombre_proyecto) {
-    candidates.add(path.join(sessionState.projectPath, sessionState.phase2Result.nombre_proyecto));
+  const candidates: string[] = [];
+
+  const addCandidate = (candidate?: string | null) => {
+    if (!candidate) return;
+    const trimmed = String(candidate).trim();
+    if (!trimmed) return;
+    if (!candidates.includes(trimmed)) {
+      candidates.push(trimmed);
+    }
+  };
+
+  const phase2ProjectName = sessionState.phase2Result?.nombre_proyecto;
+
+  // Prioridad alta: ruta concreta del proyecto generado en FASE 2.
+  if (phase2ProjectName) {
+    addCandidate(sessionState.projectPath ? path.join(sessionState.projectPath, phase2ProjectName) : null);
+    addCandidate(sessionState.currentWorkDir ? path.join(sessionState.currentWorkDir, phase2ProjectName) : null);
+    addCandidate(path.join(process.cwd(), phase2ProjectName));
   }
 
+  // Prioridad media: ubicaciones de sesión.
+  addCandidate(sessionState.projectPath);
+  addCandidate(sessionState.currentWorkDir);
+
+  // Fallback: cwd del proceso.
+  addCandidate(process.cwd());
+
+  let bestCandidate: string | null = null;
+  let bestScore = -1;
+
   for (const candidate of candidates) {
-    if (!candidate) continue;
     const angularJson = path.join(candidate, 'angular.json');
     const packageJson = path.join(candidate, 'package.json');
     const srcDir = path.join(candidate, 'src');
-    if (await pathExists(angularJson) || await pathExists(packageJson) || await pathExists(srcDir)) {
-      return candidate;
+
+    const hasAngular = await pathExists(angularJson);
+    const hasPackage = await pathExists(packageJson);
+    const hasSrc = await pathExists(srcDir);
+
+    const score = hasAngular ? 3 : (hasPackage && hasSrc ? 2 : (hasPackage || hasSrc ? 1 : 0));
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = candidate;
+      if (score === 3) break;
     }
   }
 
-  return sessionState.currentWorkDir || sessionState.projectPath || process.cwd();
+  return bestCandidate || sessionState.currentWorkDir || sessionState.projectPath || process.cwd();
 }
+
 
 async function buildProjectStructureSnapshot(rootPath: string): Promise<Record<string, unknown>> {
   const maxEntries = 250;
@@ -830,12 +862,72 @@ function parseJSONResponse<T>(response: string): T | null {
     .replace(/[‘’]/g, "'")
     .trim();
 
-  const tryParse = (raw: string): T | null => {
-    const clean = normalize(raw)
+  const escapeUnescapedQuotesInFieldValues = (input: string, fieldNames: string[]): string => {
+    let text = input;
+
+    for (const field of fieldNames) {
+      const fieldPattern = new RegExp(`"${field}"\\s*:\\s*"`, 'g');
+      let match: RegExpExecArray | null;
+
+      while ((match = fieldPattern.exec(text)) !== null) {
+        const valueStart = match.index + match[0].length;
+        let i = valueStart;
+        let repaired = '';
+
+        while (i < text.length) {
+          const ch = text[i];
+
+          if (ch === '"' && text[i - 1] !== '\\') {
+            const tail = text.slice(i + 1);
+            const nextNonSpace = tail.match(/^\s*/)?.[0].length ?? 0;
+            const token = tail[nextNonSpace] || '';
+            if (token === ',' || token === '}' || token === ']') {
+              break;
+            }
+            repaired += '\\"';
+            i++;
+            continue;
+          }
+
+          repaired += ch;
+          i++;
+        }
+
+        if (i >= text.length) break;
+
+        text = `${text.slice(0, valueStart)}${repaired}${text.slice(i)}`;
+        fieldPattern.lastIndex = valueStart + repaired.length + 1;
+      }
+    }
+
+    return text;
+  };
+
+  const repairCommonJsonIssues = (raw: string): string => {
+    const noFences = normalize(raw)
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i, '')
       .replace(/```$/i, '')
       .trim();
+
+    const escapedFieldValues = escapeUnescapedQuotesInFieldValues(noFences, [
+      'contenido',
+      'comando',
+      'instruccion',
+      'descripcion',
+      'mensaje',
+      'razon',
+      'justificacion',
+      'causa_raiz',
+    ]);
+
+    return escapedFieldValues
+      .replace(/,\s*([}\]])/g, '$1')
+      .trim();
+  };
+
+  const tryParse = (raw: string): T | null => {
+    const clean = repairCommonJsonIssues(raw);
 
     try {
       return JSON.parse(clean) as T;
@@ -908,6 +1000,7 @@ function parseJSONResponse<T>(response: string): T | null {
 
   return null;
 }
+
 
 function parseInterpretation(response: string): { tipo: string; descripcion: string; necesita_ia_web: boolean } | null {
   try {
