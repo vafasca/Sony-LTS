@@ -19,6 +19,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
   const psPatterns = [
     /^Set-Location/i, /^Get-/i, /^New-Item/i, /^Remove-Item/i,
     /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
+    /^Add-Content/i, /^Set-Content/i, /^Out-File/i, /^Clear-Content/i,
     /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
     /^Test-Connection/i, /^Start-/i, /^Stop-/i,
     /^\(\s*Get-/i,  // (Get-... expresiones
@@ -36,6 +37,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
     || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
     || /\[version\]/i.test(trimmed)
     || /\bWrite-Output\b/i.test(trimmed)
+    || /\b(Add-Content|Set-Content|Out-File|Select-String|Where-Object|ConvertFrom-Json|Get-Content)\b/i.test(trimmed)
     || /\bSilentlyContinue\b/i.test(trimmed)
     || /\bcatch\s*\{/i.test(trimmed);
 }
@@ -70,6 +72,20 @@ function cleanCommand(cmd: string): string {
 
 function stripAnsi(text: string): string {
   return String(text || '').replace(/\u001B\[[0-9;]*m/g, '');
+}
+
+
+function normalizeKnownProblematicCommand(cmd: string): string {
+  const normalized = cmd.trim();
+
+  // Normalización defensiva para verificación de VS Code: evitar casteos [version] sobre líneas vacías/hash.
+  if (/Get-Command\s+code/i.test(normalized)
+    && /code\s+--version/i.test(normalized)
+    && /\[version\]\$v/i.test(normalized)) {
+    return `if (Get-Command code -ErrorAction SilentlyContinue) { $v = (code --version | Where-Object { $_ -match '^\d+\.\d+' } | Select-Object -First 1); if ($v -and ([version]$v -ge [version]'1.80.0')) { Write-Output "OK-$v" } elseif ($v) { Write-Output "OUT_OF_RANGE-$v" } else { Write-Output 'MISSING' } } else { Write-Output 'MISSING' }`;
+  }
+
+  return cmd;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -431,7 +447,7 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   // LIMPIAR COMANDO - Eliminar símbolos de prompt
   // Los prompts como $, #, >, PS C:\> NO son parte del comando
   // ═══════════════════════════════════════════════════════════════
-  const cleanedCmd = cleanCommand(cmd);
+  const cleanedCmd = normalizeKnownProblematicCommand(cleanCommand(cmd));
   
   const commandCwd = sessionState.currentWorkDir;
 
@@ -857,6 +873,27 @@ async function createFile(nombre: string, contenido: string): Promise<{ success:
       };
     }
 
+    const normalizedRelativePath = normalizedTarget.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (/^src\/app\/app\.ts$/i.test(normalizedRelativePath)) {
+      const nextContent = String(contenido || '');
+      const looksLikeHtml = /<html|<!doctype|<body|<router-outlet/i.test(nextContent);
+      const hasAppExport = /export\s+class\s+AppComponent\b/.test(nextContent);
+
+      if (looksLikeHtml || !hasAppExport) {
+        try {
+          const existingContent = await fs.readFile(filePath, 'utf-8');
+          if (/export\s+class\s+AppComponent\b/.test(existingContent)) {
+            return {
+              success: true,
+              message: `Escritura omitida para preservar módulo válido en ${filePath}`,
+            };
+          }
+        } catch {
+          // Si no existe contenido previo válido, permitimos escribir para no bloquear bootstrap inicial.
+        }
+      }
+    }
+
     const dir = path.dirname(filePath);
     
     // Crear directorios si no existen
@@ -1175,6 +1212,7 @@ REGLAS:
 31. NO incluyas navegadores web como requisito, ni comandos de verificación/instalación de navegadores
 32. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
 33. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
+34. Para verificar Visual Studio Code en PowerShell, extrae una versión semántica válida (ej: $v = (code --version | Where-Object { $_ -match '^\\d+\\.\\d+' } | Select-Object -First 1)) antes de usar [version]
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -1373,6 +1411,7 @@ REGLAS:
 18. Solo modifica/crea rutas coherentes con "ESTRUCTURA CREADA EN FASE 2"; si necesitas un archivo nuevo, colócalo dentro de carpetas ya existentes del proyecto
 19. No propongas crear archivos en prefijos de workspace ajenos (ej. src/... fuera del proyecto o rutas al nivel del workspace padre)
 20. En el primer bloque, prioriza actualizar los archivos base detectados en la estructura real antes de crear rutas alternativas
+21. Evita comandos de parcheo incremental como Add-Content para TypeScript crítico; cuando debas cambiar código Angular, devuelve el archivo completo en "archivos" con operacion "modificar"
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
