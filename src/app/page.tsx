@@ -85,6 +85,7 @@ interface Message {
 interface GeneratedFile {
   nombre: string;
   ruta: string;
+  tipo?: 'file' | 'directory';
   contenido: string;
 }
 
@@ -299,7 +300,61 @@ export default function SonnyAgent() {
     } finally {
       setIsLoadingSystemInfo(false);
     }
+  }, [])
+
+  const refreshProjectFiles = useCallback(async (rootDir: string) => {
+    if (!rootDir) return;
+    try {
+      const response = await fetch(`/api/project-files?root=${encodeURIComponent(rootDir)}`);
+      const data = await response.json();
+      if (!response.ok || !data.success || !Array.isArray(data.items)) return;
+
+      const mapped: GeneratedFile[] = data.items.map((item: { nombre: string; ruta: string; tipo: 'file' | 'directory' }) => ({
+        nombre: item.ruta,
+        ruta: item.ruta,
+        tipo: item.tipo,
+        contenido: '',
+      }));
+
+      setGeneratedFiles(mapped);
+
+      if (activeFile?.ruta) {
+        const updatedActive = mapped.find(f => f.ruta === activeFile.ruta);
+        if (!updatedActive) setActiveFile(null);
+      }
+    } catch (error) {
+      console.error('[ProjectFiles] Error refreshing file list:', error);
+    }
+  }, [activeFile?.ruta]);
+
+  const loadFileContent = useCallback(async (file: GeneratedFile, rootDir: string) => {
+    if (file.tipo === 'directory') {
+      setActiveFile(file);
+      setActiveTab('code');
+      return;
+    }
+
+    if (!rootDir) {
+      setActiveFile(file);
+      setActiveTab('code');
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/project-files?action=content&root=${encodeURIComponent(rootDir)}&file=${encodeURIComponent(file.ruta)}`);
+      const data = await response.json();
+      if (response.ok && data.success) {
+        setActiveFile({ ...file, contenido: String(data.content || '') });
+      } else {
+        setActiveFile({ ...file, contenido: `No se pudo cargar el archivo: ${data.error || 'Error desconocido'}` });
+      }
+      setActiveTab('code');
+    } catch (error) {
+      setActiveFile({ ...file, contenido: `Error cargando contenido: ${error}` });
+      setActiveTab('code');
+    }
   }, []);
+;
   
   // Browse folder dialog
   const browseFolder = useCallback(async () => {
@@ -487,6 +542,7 @@ export default function SonnyAgent() {
           aiProvider: selectedAI,
           groqApiKey,
           osInfo,
+          projectFolder,
         }),
       });
 
@@ -531,6 +587,7 @@ export default function SonnyAgent() {
       // FASE 2: Ejecutar pasos con streaming en tiempo real
       if (steps.length > 0) {
         const workDir = typeof data.workDir === "string" ? data.workDir : "";
+        if (workDir) await refreshProjectFiles(workDir);
         const success = await executeWithStreaming(steps, workDir);
         
         // Obtener conteo del estado actual
@@ -553,7 +610,7 @@ export default function SonnyAgent() {
     } finally {
       setIsProcessing(false);
     }
-  }, [input, isProcessing, osInfo, selectedAI, groqApiKey, addMessage, updateMessage]);
+  }, [input, isProcessing, osInfo, selectedAI, groqApiKey, projectFolder, addMessage, updateMessage, refreshProjectFiles]);
 
   const stopProcess = useCallback(() => {
     setIsProcessing(false);
@@ -562,6 +619,7 @@ export default function SonnyAgent() {
 
   // Función para ejecutar pasos con streaming en tiempo real - CON RETRY LOGIC
   const executeWithStreaming = useCallback(async (steps: ExecutionStep[], workDir: string) => {
+    let currentWorkDir = workDir;
     const totalSteps = steps.length;
     const requirementStatus: Record<string, { verified: boolean; output: string; expected: string; metExpectation: boolean }> = {};
 
@@ -664,13 +722,17 @@ ${skipOutput}`, status: "success" } : tc
                     descripcion: step.descripcion,
                     comandos: [cmd],
                   }],
-                  ...(workDir ? { workDir } : {}),
+                  ...(currentWorkDir ? { workDir: currentWorkDir } : {}),
                   retryAttempts: { 0: localRetryAttempts[i] || 0 },
                 }),
               });
 
               const execData = await execResponse.json();
-              
+              if (typeof execData.workDir === 'string' && execData.workDir) {
+                currentWorkDir = execData.workDir;
+                await refreshProjectFiles(currentWorkDir);
+              }
+
               // Manejar respuesta de error con retry
               if (execData.needsRetry || execData.maxRetriesReached) {
                 attemptCount = execData.currentAttempt || attemptCount + 1;
@@ -849,7 +911,7 @@ ${skipOutput}`, status: "success" } : tc
     }
 
     return true;
-  }, [retryAttempts]);
+  }, [retryAttempts, refreshProjectFiles]);
 
   const copyCode = useCallback((content: string) => {
     navigator.clipboard.writeText(content);
@@ -1250,7 +1312,11 @@ ${skipOutput}`, status: "success" } : tc
                       <span className="text-sm">{activeFile.ruta}</span>
                     </div>
                     <ScrollArea className="flex-1">
-                      <pre className="p-4 text-sm font-mono text-slate-200 whitespace-pre-wrap">{activeFile.contenido}</pre>
+                      {activeFile.tipo === 'directory' ? (
+                        <div className="p-4 text-sm text-slate-300">Carpeta seleccionada: {activeFile.ruta}</div>
+                      ) : (
+                        <pre className="p-4 text-sm font-mono text-slate-200 whitespace-pre-wrap">{activeFile.contenido}</pre>
+                      )}
                     </ScrollArea>
                   </div>
                 ) : (
@@ -1267,8 +1333,8 @@ ${skipOutput}`, status: "success" } : tc
                   {generatedFiles.length > 0 ? (
                     <div className="space-y-1">
                       {generatedFiles.map((file, index) => (
-                        <button key={index} onClick={() => { setActiveFile(file); setActiveTab("code"); }} className={`flex items-center gap-2 w-full px-2 py-1.5 hover:bg-slate-700 rounded text-left text-sm ${activeFile?.nombre === file.nombre ? "bg-slate-700" : ""}`}>
-                          <FileCode className="h-4 w-4 text-blue-400" />
+                        <button key={index} onClick={() => loadFileContent(file, projectFolder)} className={`flex items-center gap-2 w-full px-2 py-1.5 hover:bg-slate-700 rounded text-left text-sm ${activeFile?.nombre === file.nombre ? "bg-slate-700" : ""}`}>
+                          {file.tipo === 'directory' ? <FolderTree className="h-4 w-4 text-yellow-400" /> : <FileCode className="h-4 w-4 text-blue-400" />}
                           <span>{file.nombre}</span>
                         </button>
                       ))}

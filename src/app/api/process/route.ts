@@ -435,6 +435,46 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   console.log(`[executeCommand] Directorio de trabajo: ${commandCwd}`);
   
   try {
+    let commandToRun = cleanedCmd;
+    let executionCwd = commandCwd;
+
+    // Soportar comandos compuestos del tipo:
+    //   cd <ruta>; <comando>
+    //   cd <ruta> && <comando>
+    // para evitar que se interpreten como un único "cd" inválido.
+    const chainedCdPatterns = [
+      /^cd\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+      /^Set-Location\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+      /^sl\s+([^;&]+)\s*(?:;|&&)\s*(.+)$/i,
+    ];
+
+    for (const pattern of chainedCdPatterns) {
+      const match = commandToRun.match(pattern);
+      if (!match) continue;
+
+      const targetDir = match[1].trim().replace(/^["']|["']$/g, '');
+      const trailingCommand = (match[2] || '').trim();
+      const newDir = path.isAbsolute(targetDir)
+        ? targetDir
+        : path.join(commandCwd, targetDir);
+
+      try {
+        await fs.access(newDir);
+        sessionState.currentWorkDir = newDir;
+        executionCwd = newDir;
+        commandToRun = trailingCommand;
+        console.log(`[executeCommand] ℹ️ Comando compuesto detectado. cwd=${newDir}; comando=${commandToRun}`);
+      } catch {
+        console.log(`[executeCommand] ❌ Directorio no encontrado en comando compuesto: ${newDir}`);
+        return {
+          success: false,
+          output: `Directorio no encontrado: ${newDir}`,
+          exitCode: 1,
+        };
+      }
+      break;
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // INTERCEPTAR COMANDOS DE CAMBIO DE DIRECTORIO
     // Estos comandos no funcionan entre llamadas porque cada llamada
@@ -443,14 +483,14 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     
     // Patrones de cambio de directorio para diferentes shells
     const cdPatterns = [
-      /^cd\s+(.+)$/i,                                    // bash/cmd: cd ruta
-      /^Set-Location\s+["']?(.+?)["']?\s*$/i,           // PowerShell: Set-Location "ruta"
-      /^sl\s+["']?(.+?)["']?\s*$/i,                     // PowerShell alias: sl ruta
-      /^pushd\s+(.+)$/i,                                // pushd ruta
+      /^cd\s+([^;&]+)\s*$/i,                              // bash/cmd: cd ruta
+      /^Set-Location\s+["']?([^;&]+?)["']?\s*$/i,        // PowerShell: Set-Location "ruta"
+      /^sl\s+["']?([^;&]+?)["']?\s*$/i,                  // PowerShell alias: sl ruta
+      /^pushd\s+([^;&]+)\s*$/i,                           // pushd ruta
     ];
     
     for (const pattern of cdPatterns) {
-      const match = cleanedCmd.match(pattern);
+      const match = commandToRun.match(pattern);
       if (match) {
         let targetDir = match[1].trim().replace(/^["']|["']$/g, '');
         
@@ -515,14 +555,31 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
     // ═══════════════════════════════════════════════════════════════
     
     let result;
+
+    // Normalizar scaffolding Angular cuando llega una ruta absoluta en "ng new".
+    // Angular CLI espera nombre de proyecto (no ruta absoluta) y opcionalmente --directory.
+    const ngNewMatch = commandToRun.match(/^ng\s+new\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i);
+    if (ngNewMatch) {
+      const targetRaw = (ngNewMatch[1] || ngNewMatch[2] || ngNewMatch[3] || '').trim();
+      const restArgs = ngNewMatch[4] || '';
+      const hasDirectoryArg = /\s--directory(?:\s|=)/i.test(restArgs);
+
+      if (targetRaw && (path.isAbsolute(targetRaw) || targetRaw.includes('\\') || targetRaw.includes('/')) && !hasDirectoryArg) {
+        const projectName = path.basename(targetRaw).replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'app';
+        const parentDir = path.dirname(targetRaw);
+        commandToRun = `ng new "${projectName}" --directory "${targetRaw}"${restArgs}`;
+        executionCwd = parentDir;
+        console.log(`[executeCommand] ℹ️ Normalizado ng new: ${commandToRun}`);
+      }
+    }
     
     // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
-    if (isWindows && isPowerShellCmdlet(cleanedCmd)) {
+    if (isWindows && isPowerShellCmdlet(commandToRun)) {
       console.log('[executeCommand] Estrategia: PowerShell cmdlet');
-      result = await runPowerShellCommand(cleanedCmd, commandCwd);
+      result = await runPowerShellCommand(commandToRun, executionCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
-      result = await runCommand(cleanedCmd, commandCwd);
+      result = await runCommand(commandToRun, executionCwd);
     }
     
     const output = (result.stdout || '') + (result.stderr || '');
@@ -801,9 +858,10 @@ REGLAS:
 27. Los comandos de verificación deben usar opciones CLI estables y documentadas (sin flags experimentales)
 28. Los comandos de hardware deben devolver enteros normalizados (Floor o Round)
 29. Antes de usar npm/pip/u otros gestores, verifica si existe paquete en ${systemInfo.gestor_paquetes}; si existe, usa ${systemInfo.gestor_paquetes}
-30. Para tareas de desarrollo web incluye como mínimo un editor de código y un navegador moderno
-31. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
-32. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
+30. Para tareas de desarrollo web incluye como mínimo un editor de código
+31. NO incluyas navegadores web como requisito, ni comandos de verificación/instalación de navegadores
+32. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
+33. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -1058,7 +1116,23 @@ export async function POST(request: NextRequest) {
       steps: providedSteps,
       errorReport,
       bloqueActual,
+      projectFolder,
     } = body;
+
+    if (projectFolder && typeof projectFolder === 'string') {
+      const normalizedProjectFolder = projectFolder.trim();
+      if (normalizedProjectFolder) {
+        try {
+          const stats = await fs.stat(normalizedProjectFolder);
+          if (stats.isDirectory()) {
+            sessionState.currentWorkDir = normalizedProjectFolder;
+            console.log(`[Process] Carpeta base del proyecto: ${sessionState.currentWorkDir}`);
+          }
+        } catch {
+          console.log(`[Process] ⚠️ projectFolder inválido: ${normalizedProjectFolder}`);
+        }
+      }
+    }
 
     // Detectar entorno del servidor
     const systemInfo = await detectServerEnvironment();
@@ -1173,6 +1247,14 @@ export async function POST(request: NextRequest) {
                 const synthesizedMarker = outputUpper.includes('OUT_OF_RANGE') ? 'OUT_OF_RANGE-INVALID_VERSION' : 'MISSING';
                 result.success = true;
                 result.outputs.push(`[verification] normalized_marker=${synthesizedMarker}; reason=version_parse_error`);
+                continue;
+              }
+
+              if (isVerificationStep && /COMMANDNOTFOUNDEXCEPTION|NO SE RECONOCE COMO NOMBRE DE UN CMDLET|IS NOT RECOGNIZED|OBJECTNOTFOUND|EL T[ÉE]RMINO/i.test(outputUpper)) {
+                // Si el ejecutable no existe, tratar como "MISSING" para pasar a instalación,
+                // en lugar de consumir reintentos con el mismo error.
+                result.success = true;
+                result.outputs.push('[verification] normalized_marker=MISSING; reason=command_not_found');
                 continue;
               }
 
@@ -1446,6 +1528,7 @@ export async function POST(request: NextRequest) {
       const projectName = message?.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30) || `proyecto-${Date.now()}`;
       const projectPath = path.join(sessionState.currentWorkDir, projectName);
       sessionState.projectPath = projectPath;
+      await fs.mkdir(projectPath, { recursive: true });
 
       let browserModule;
       try {
@@ -1479,7 +1562,7 @@ export async function POST(request: NextRequest) {
       }
 
       sessionState.phase2Result = phase2Result;
-      sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+      sessionState.currentWorkDir = projectPath;
 
       // Construir pasos de ejecución
       const executionSteps: ExecutionStep[] = [];
@@ -1529,6 +1612,7 @@ export async function POST(request: NextRequest) {
         phase2Result,
         executionSteps,
         projectPath,
+        workDir: sessionState.currentWorkDir,
         systemInfo,
         rawResponse: promptResult.response,
       });
@@ -1766,6 +1850,7 @@ export async function POST(request: NextRequest) {
     const projectName = message.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 30);
     const projectPath = path.join(sessionState.currentWorkDir, projectName);
     sessionState.projectPath = projectPath;
+    await fs.mkdir(projectPath, { recursive: true });
     
     const phase2Prompt = buildPhase2Prompt(systemInfo, message, analysis.decisiones_tomadas, projectPath);
     promptResult = await sendPrompt(phase2Prompt);
@@ -1774,7 +1859,7 @@ export async function POST(request: NextRequest) {
       const phase2Result = parseJSONResponse<Phase2Response>(promptResult.response);
       if (phase2Result) {
         sessionState.phase2Result = phase2Result;
-        sessionState.currentWorkDir = phase2Result.ruta_proyecto;
+        sessionState.currentWorkDir = projectPath;
         
         phase2Result.pasos.forEach((paso, idx) => {
           if (paso.tipo === 'comando' && paso.comando) {
@@ -1804,6 +1889,7 @@ export async function POST(request: NextRequest) {
       analysis,
       interpretation,
       projectPath: sessionState.projectPath,
+      workDir: sessionState.currentWorkDir,
       systemInfo,
     });
 
