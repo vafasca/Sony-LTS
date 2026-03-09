@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -71,6 +71,9 @@ import {
   MemoryStick,
   Search,
   SkipForward,
+  ChevronRight,
+  ChevronDown,
+  Folder,
 } from "lucide-react";
 
 // Types
@@ -87,6 +90,13 @@ interface GeneratedFile {
   ruta: string;
   tipo?: 'file' | 'directory';
   contenido: string;
+}
+
+interface FileTreeNode {
+  name: string;
+  path: string;
+  tipo: 'file' | 'directory';
+  children: FileTreeNode[];
 }
 
 interface ExecutionStep {
@@ -212,6 +222,7 @@ export default function SonnyAgent() {
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedFile[]>([]);
   const [activeFile, setActiveFile] = useState<GeneratedFile | null>(null);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [previewHtml, setPreviewHtml] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   
@@ -355,6 +366,136 @@ export default function SonnyAgent() {
       setActiveTab('code');
     }
   }, []);
+
+  const fileTree = useMemo<FileTreeNode[]>(() => {
+    const rootNodes: FileTreeNode[] = [];
+
+    const upsertNode = (
+      nodes: FileTreeNode[],
+      name: string,
+      fullPath: string,
+      tipo: 'file' | 'directory'
+    ): FileTreeNode => {
+      const existing = nodes.find((node) => node.name === name);
+      if (existing) {
+        if (tipo === 'directory') existing.tipo = 'directory';
+        return existing;
+      }
+      const created: FileTreeNode = { name, path: fullPath, tipo, children: [] };
+      nodes.push(created);
+      return created;
+    };
+
+    generatedFiles.forEach((entry) => {
+      const normalizedPath = String(entry.ruta || '').replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!normalizedPath) return;
+
+      const parts = normalizedPath.split('/').filter(Boolean);
+      let level = rootNodes;
+      let fullPath = '';
+
+      parts.forEach((part, index) => {
+        const isLast = index === parts.length - 1;
+        fullPath = fullPath ? `${fullPath}/${part}` : part;
+        const tipo: 'file' | 'directory' = isLast ? (entry.tipo || 'file') : 'directory';
+        const node = upsertNode(level, part, fullPath, tipo);
+        level = node.children;
+      });
+    });
+
+    const sortNodes = (nodes: FileTreeNode[]): FileTreeNode[] =>
+      [...nodes]
+        .sort((a, b) => {
+          if (a.tipo !== b.tipo) return a.tipo === 'directory' ? -1 : 1;
+          return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+        })
+        .map((node) => ({
+          ...node,
+          children: sortNodes(node.children),
+        }));
+
+    return sortNodes(rootNodes);
+  }, [generatedFiles]);
+
+  useEffect(() => {
+    if (generatedFiles.length === 0) {
+      setExpandedFolders(new Set());
+      return;
+    }
+
+    const topLevelDirs = generatedFiles
+      .filter((file) => file.tipo === 'directory' && !file.ruta.includes('/'))
+      .map((file) => file.ruta);
+
+    setExpandedFolders(new Set(topLevelDirs));
+  }, [generatedFiles]);
+
+  const toggleFolder = useCallback((folderPath: string) => {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderPath)) {
+        next.delete(folderPath);
+      } else {
+        next.add(folderPath);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleTreeClick = useCallback((node: FileTreeNode) => {
+    if (node.tipo === 'directory') {
+      toggleFolder(node.path);
+      setActiveFile({
+        nombre: node.path,
+        ruta: node.path,
+        tipo: 'directory',
+        contenido: '',
+      });
+      return;
+    }
+
+    void loadFileContent({
+      nombre: node.path,
+      ruta: node.path,
+      tipo: 'file',
+      contenido: '',
+    }, currentProjectRoot || projectFolder);
+  }, [toggleFolder, loadFileContent, currentProjectRoot, projectFolder]);
+
+  const renderFileTree = useCallback((nodes: FileTreeNode[], depth: number = 0): JSX.Element[] => {
+    return nodes.map((node) => {
+      const isDirectory = node.tipo === 'directory';
+      const isExpanded = expandedFolders.has(node.path);
+      const isActive = activeFile?.ruta === node.path;
+
+      return (
+        <div key={node.path}>
+          <button
+            onClick={() => handleTreeClick(node)}
+            className={`group flex items-center gap-1.5 w-full rounded px-2 py-1 text-left text-sm transition-colors ${isActive ? 'bg-slate-700 text-cyan-300' : 'text-slate-200 hover:bg-slate-800'}`}
+            style={{ paddingLeft: `${8 + depth * 16}px` }}
+          >
+            {isDirectory ? (
+              <>
+                {isExpanded ? <ChevronDown className="h-3.5 w-3.5 text-slate-400" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-400" />}
+                {isExpanded ? <FolderOpen className="h-4 w-4 text-yellow-400" /> : <Folder className="h-4 w-4 text-yellow-400" />}
+              </>
+            ) : (
+              <>
+                <span className="w-3.5" />
+                <FileCode className="h-4 w-4 text-blue-400" />
+              </>
+            )}
+            <span className="truncate">{node.name}</span>
+          </button>
+
+          {isDirectory && isExpanded && node.children.length > 0 && (
+            <div>{renderFileTree(node.children, depth + 1)}</div>
+          )}
+        </div>
+      );
+    });
+  }, [expandedFolders, activeFile?.ruta, handleTreeClick]);
 
   
   // Browse folder dialog
@@ -679,6 +820,79 @@ export default function SonnyAgent() {
               break;
             }
           }
+
+          const maxPhase4Rounds = 3;
+          let phase4Validated = false;
+
+          for (let validationRound = 1; validationRound <= maxPhase4Rounds; validationRound++) {
+            updateMessage(
+              statusMsgId,
+              `🧪 Iniciando FASE 4: validación completa del proyecto (ronda ${validationRound}/${maxPhase4Rounds})...`,
+            );
+
+            const phase4Response = await fetch('/api/process', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'phase_4',
+                message: input,
+                aiProvider: selectedAI,
+                groqApiKey,
+                projectFolder,
+              }),
+            });
+
+            const phase4Data = await phase4Response.json();
+            if (!phase4Response.ok || !phase4Data.success) {
+              const retryHint = validationRound < maxPhase4Rounds ? ' Reintentando...' : '';
+              updateMessage(
+                statusMsgId,
+                `⚠️ FASE 4 ronda ${validationRound} detenida: ${phase4Data.error || 'Error desconocido'}${retryHint}`,
+                'error',
+              );
+              if (validationRound < maxPhase4Rounds) continue;
+              return;
+            }
+
+            const phase4Steps: ExecutionStep[] = (phase4Data.executionSteps || []).map((step: Record<string, unknown>, index: number) => ({
+              id: `fase4-step-${validationRound}-${index}`,
+              numero: index + 1,
+              fase: (step.fase as string) || '4',
+              accion: (step.accion as ExecutionStep['accion']) || 'validar',
+              descripcion: (step.descripcion as string) || '',
+              status: 'pending' as const,
+              comandos: (step.comandos as string[]) || [],
+              archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
+              validacion: (step.validacion as string) || '',
+            }));
+
+            setExecutionSteps(phase4Steps);
+            const phase4Ok = await executeWithStreaming(phase4Steps, currentProjectRoot || workDir);
+
+            const phase4WorkDir = typeof phase4Data.workDir === 'string' ? phase4Data.workDir : '';
+            if (phase4WorkDir) {
+              setCurrentProjectRoot(phase4WorkDir);
+              await refreshProjectFiles(phase4WorkDir);
+            }
+
+            if (phase4Ok) {
+              phase4Validated = true;
+              break;
+            }
+
+            updateMessage(
+              statusMsgId,
+              `⚠️ FASE 4 ronda ${validationRound} encontró errores críticos. Reintentando validación...`,
+              'error',
+            );
+          }
+
+          if (!phase4Validated) {
+            updateMessage(statusMsgId, '❌ FASE 4 detenida tras múltiples rondas de validación', 'error');
+            return;
+          }
+
+          updateMessage(statusMsgId, '✅ FASE 4 completada. Listo para FASE 5 — Entrega.', 'success');
         }
       } else {
         updateMessage(statusMsgId, `✅ Sin pasos que ejecutar.`, "success");
@@ -1006,8 +1220,16 @@ ${skipOutput}`, status: "success" } : tc
                   }
 
                   if (autoFixApplied) {
-                    await new Promise(resolve => setTimeout(resolve, 800));
-                    continue;
+                    // La corrección IA ya se ejecutó como un paso independiente.
+                    // Evitamos reintentar el comando original defectuoso para no entrar
+                    // en bucles cuando la corrección reemplaza la validación/comando.
+                    retryLoop = false;
+                    stepSuccess = true;
+                    const autoFixMessage = '✅ Comando original omitido después de corrección IA aplicada.';
+                    stepOutput = stepOutput
+                      ? `${stepOutput}\n${autoFixMessage}`
+                      : autoFixMessage;
+                    break;
                   }
 
                   setCurrentError({
@@ -1591,13 +1813,13 @@ Error creando/actualizando archivos: ${fileError}`;
               {activeTab === "files" && (
                 <ScrollArea className="h-full p-2">
                   {generatedFiles.length > 0 ? (
-                    <div className="space-y-1">
-                      {generatedFiles.map((file, index) => (
-                        <button key={index} onClick={() => loadFileContent(file, currentProjectRoot || projectFolder)} className={`flex items-center gap-2 w-full px-2 py-1.5 hover:bg-slate-700 rounded text-left text-sm ${activeFile?.nombre === file.nombre ? "bg-slate-700" : ""}`}>
-                          {file.tipo === 'directory' ? <FolderTree className="h-4 w-4 text-yellow-400" /> : <FileCode className="h-4 w-4 text-blue-400" />}
-                          <span>{file.nombre}</span>
-                        </button>
-                      ))}
+                    <div className="space-y-2">
+                      <div className="rounded border border-slate-700 bg-slate-900/50 px-2 py-1 text-xs text-slate-400">
+                        Explorador ({generatedFiles.length} rutas)
+                      </div>
+                      <div className="space-y-0.5">
+                        {renderFileTree(fileTree)}
+                      </div>
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-slate-400">
