@@ -1096,6 +1096,22 @@ function parseJSONResponse<T>(response: string): T | null {
       'razon',
       'justificacion',
       'causa_raiz',
+      'url',
+      'nombre',
+      'id',
+      'nivel',
+      'motivo_omision',
+      'stack',
+      'tipo_proyecto',
+      'salida_esperada',
+      'salida_error',
+      'comparador',
+      'progreso',
+      'siguiente_fase',
+      'siguiente_bloque',
+      'operacion',
+      'ruta',
+      'accion',
     ]);
 
     const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues);
@@ -1174,6 +1190,14 @@ function parseJSONResponse<T>(response: string): T | null {
 
   for (const candidate of candidates) {
     const parsed = tryParse(candidate);
+    if (parsed) return parsed;
+  }
+
+  // 4) Fallback agresivo: desde la primera '{' hasta la última '}'
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const parsed = tryParse(text.slice(firstBrace, lastBrace + 1));
     if (parsed) return parsed;
   }
 
@@ -1451,7 +1475,7 @@ REGLAS:
 9. El campo "bloques_pendientes" debe listar todos los bloques que faltan después del actual
 10. No incluyas campos ni llaves fuera del esquema JSON definido
 11. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
-12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \" (ejemplo: \"texto\")
+12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \\" (ejemplo: \\"texto\\")
 13. No uses markdown (sin enlaces tipo [texto](url), sin bloques fenced), solo strings JSON puros
 14. Si incluyes comandos PowerShell con rutas, usa comillas escapadas válidas dentro del JSON
 15. No encadenes múltiples objetos JSON en una sola respuesta; devuelve exactamente UN objeto raíz
@@ -1532,7 +1556,7 @@ REGLAS:
 3. Cada validación debe tener un comando ejecutable con salida esperada concreta y comparador. Nunca uses instrucciones para humanos como "verificar visualmente" como única validación
 4. Las validaciones deben ejecutarse en orden estricto. Si una falla las siguientes no se ejecutan hasta que se corrija
 5. Si el stack NO tiene framework (HTML puro), adapta las validaciones: verifica existencia de archivos, ausencia de links rotos y apertura correcta en navegador
-6. El campo "comando" de cada validacion debe tener comillas internas escapadas con \" para garantizar JSON válido
+6. El campo "comando" de cada validacion debe tener comillas internas escapadas con \\" para garantizar JSON válido
 7. El bloque "resumen_final" debe contener un único comando que ejecute el proyecto completo y confirme que está listo para entrega
 8. No incluyas campos ni llaves fuera del esquema JSON definido
 9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
