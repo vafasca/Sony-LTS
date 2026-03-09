@@ -19,6 +19,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
   const psPatterns = [
     /^Set-Location/i, /^Get-/i, /^New-Item/i, /^Remove-Item/i,
     /^Write-/i, /^Test-Path/i, /^Copy-Item/i, /^Move-Item/i,
+    /^Add-Content/i, /^Set-Content/i, /^Out-File/i, /^Clear-Content/i,
     /^Get-CimInstance/i, /^Get-PSDrive/i, /^Get-ChildItem/i,
     /^Test-Connection/i, /^Start-/i, /^Stop-/i,
     /^\(\s*Get-/i,  // (Get-... expresiones
@@ -36,6 +37,7 @@ function isPowerShellCmdlet(cmd: string): boolean {
     || /\[[A-Za-z0-9_.]+\]::/.test(trimmed)
     || /\[version\]/i.test(trimmed)
     || /\bWrite-Output\b/i.test(trimmed)
+    || /\b(Add-Content|Set-Content|Out-File|Select-String|Where-Object|ConvertFrom-Json|Get-Content)\b/i.test(trimmed)
     || /\bSilentlyContinue\b/i.test(trimmed)
     || /\bcatch\s*\{/i.test(trimmed);
 }
@@ -70,6 +72,20 @@ function cleanCommand(cmd: string): string {
 
 function stripAnsi(text: string): string {
   return String(text || '').replace(/\u001B\[[0-9;]*m/g, '');
+}
+
+
+function normalizeKnownProblematicCommand(cmd: string): string {
+  const normalized = cmd.trim();
+
+  // Normalización defensiva para verificación de VS Code: evitar casteos [version] sobre líneas vacías/hash.
+  if (/Get-Command\s+code/i.test(normalized)
+    && /code\s+--version/i.test(normalized)
+    && /\[version\]\$v/i.test(normalized)) {
+    return `if (Get-Command code -ErrorAction SilentlyContinue) { $v = (code --version | Where-Object { $_ -match '^\d+\.\d+' } | Select-Object -First 1); if ($v -and ([version]$v -ge [version]'1.80.0')) { Write-Output "OK-$v" } elseif ($v) { Write-Output "OUT_OF_RANGE-$v" } else { Write-Output 'MISSING' } } else { Write-Output 'MISSING' }`;
+  }
+
+  return cmd;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -289,6 +305,36 @@ interface Phase3Response {
   siguiente_fase: string | null;
 }
 
+interface Phase4Response {
+  fase: string;
+  accion: string;
+  stack: string;
+  tipo_proyecto: 'con_framework' | 'sin_framework';
+  descripcion: string;
+  validaciones: Array<{
+    id: string;
+    nivel: 'build' | 'estructura' | 'funcionalidad' | 'responsividad' | 'performance';
+    nombre: string;
+    descripcion: string;
+    motivo_omision: string | null;
+    comando: string;
+    salida_esperada: string;
+    salida_error: string;
+    comparador: 'contains' | 'equals' | 'startsWith' | 'greaterThan' | 'exists';
+    critico: boolean;
+    accion_si_falla: string;
+  }>;
+  resumen_final: {
+    comando: string;
+    url: string | null;
+    salida_esperada: string;
+    salida_error: string;
+    comparador: 'contains' | 'equals' | 'startsWith';
+  };
+  progreso: string;
+  siguiente_fase: string;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ESTADO GLOBAL DE LA SESIÓN
 // ═══════════════════════════════════════════════════════════════
@@ -431,7 +477,7 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
   // LIMPIAR COMANDO - Eliminar símbolos de prompt
   // Los prompts como $, #, >, PS C:\> NO son parte del comando
   // ═══════════════════════════════════════════════════════════════
-  const cleanedCmd = cleanCommand(cmd);
+  const cleanedCmd = normalizeKnownProblematicCommand(cleanCommand(cmd));
   
   const commandCwd = sessionState.currentWorkDir;
 
@@ -605,9 +651,13 @@ async function executeCommand(cmd: string, systemInfo: SystemInfo): Promise<{ su
       console.log(`[executeCommand] ℹ️ Normalizado ng new (sin rutas absolutas): ${commandToRun}; cwd=${executionCwd}`);
     }
     
-    // Verificar si es un cmdlet de PowerShell que necesita ser envuelto
-    if (isWindows && isPowerShellCmdlet(commandToRun)) {
-      console.log('[executeCommand] Estrategia: PowerShell cmdlet');
+    // Evitar ejecutar secuencias con ';' en cmd.exe (en Windows ';' no separa comandos en CMD)
+    // y termina creando carpetas/literales no deseados como 'cd' o 'mkdir'.
+    const looksLikeSemicolonSequence = /;/.test(commandToRun);
+
+    // Verificar si es un cmdlet/script PowerShell que necesita ser envuelto
+    if (isWindows && (isPowerShellCmdlet(commandToRun) || looksLikeSemicolonSequence)) {
+      console.log('[executeCommand] Estrategia: PowerShell cmdlet/script');
       result = await runPowerShellCommand(commandToRun, executionCwd);
     } else {
       console.log('[executeCommand] Estrategia: Comando directo');
@@ -650,13 +700,39 @@ function normalizeProjectRelativePath(inputPath: string): string {
     return normalizedInput;
   }
 
-  // Si la IA devuelve prefijos redundantes (workspace/proyecto/.../src/app/file),
-  // recortamos al segmento de proyecto para escribir en el cwd correcto.
+  // Si la ruta ya viene prefijada con el nombre del proyecto de FASE 2,
+  // solo recortar el prefijo cuando el cwd actual YA es ese proyecto.
+  const phase2ProjectName = path.basename(sessionState.phase2Result?.nombre_proyecto || '').replace(/\\/g, '/');
+  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
+  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
+
+  if (phase2ProjectName && (normalizedInput === phase2ProjectName || normalizedInput.startsWith(`${phase2ProjectName}/`))) {
+    const cwdIsProjectRoot = cwdBase === phase2ProjectName || projectBase === phase2ProjectName;
+    if (cwdIsProjectRoot) {
+      return normalizedInput.slice(phase2ProjectName.length).replace(/^\/+/, '');
+    }
+    return normalizedInput;
+  }
+
+  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
+    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
+  }
+
+  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
+    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
+  }
+
+  // Si la IA devuelve prefijos redundantes profundos (workspace/proyecto/src/app/file),
+  // recortamos desde marcadores conocidos. No recortamos cuando solo existe
+  // un prefijo simple (ej. "landing-page-libreria/src/..."), porque podría ser válido.
   const keepFromMarkers = ['src/', 'public/', '.vscode/', 'assets/'];
   for (const marker of keepFromMarkers) {
     const markerIndex = normalizedInput.indexOf(marker);
     if (markerIndex > 0) {
-      return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+      const prefixBeforeMarker = normalizedInput.slice(0, markerIndex).replace(/\/+$/, '');
+      if (prefixBeforeMarker.includes('/')) {
+        return normalizedInput.slice(markerIndex).replace(/^\/+/, '');
+      }
     }
   }
 
@@ -678,16 +754,6 @@ function normalizeProjectRelativePath(inputPath: string): string {
     if (normalizedInput.endsWith(suffix)) {
       return rootFile;
     }
-  }
-
-  const cwdBase = path.basename(sessionState.currentWorkDir || '').replace(/\\/g, '/');
-  if (cwdBase && (normalizedInput === cwdBase || normalizedInput.startsWith(`${cwdBase}/`))) {
-    return normalizedInput.slice(cwdBase.length).replace(/^\/+/, '');
-  }
-
-  const projectBase = path.basename(sessionState.projectPath || '').replace(/\\/g, '/');
-  if (projectBase && (normalizedInput === projectBase || normalizedInput.startsWith(`${projectBase}/`))) {
-    return normalizedInput.slice(projectBase.length).replace(/^\/+/, '');
   }
 
   return normalizedInput;
@@ -820,8 +886,48 @@ async function createFile(nombre: string, contenido: string): Promise<{ success:
   console.log(`[createFile] Creando: ${nombre}`);
   
   try {
+    let targetRoot = sessionState.currentWorkDir;
+    if (sessionState.phase2Result || sessionState.projectPath) {
+      targetRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = targetRoot;
+      sessionState.projectPath = targetRoot;
+    }
+
     const normalizedTarget = normalizeProjectRelativePath(nombre);
-    const filePath = path.isAbsolute(normalizedTarget) ? normalizedTarget : path.join(sessionState.currentWorkDir, normalizedTarget);
+    const candidatePath = path.isAbsolute(normalizedTarget)
+      ? normalizedTarget
+      : path.join(targetRoot, normalizedTarget);
+    const filePath = path.resolve(candidatePath);
+    const resolvedRoot = path.resolve(targetRoot);
+
+    if (!(filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}${path.sep}`))) {
+      return {
+        success: false,
+        message: `Ruta fuera del proyecto detectada y bloqueada: ${filePath}`,
+      };
+    }
+
+    const normalizedRelativePath = normalizedTarget.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (/^src\/app\/app\.ts$/i.test(normalizedRelativePath)) {
+      const nextContent = String(contenido || '');
+      const looksLikeHtml = /<html|<!doctype|<body|<router-outlet/i.test(nextContent);
+      const hasAppExport = /export\s+class\s+AppComponent\b/.test(nextContent);
+
+      if (looksLikeHtml || !hasAppExport) {
+        try {
+          const existingContent = await fs.readFile(filePath, 'utf-8');
+          if (/export\s+class\s+AppComponent\b/.test(existingContent)) {
+            return {
+              success: true,
+              message: `Escritura omitida para preservar módulo válido en ${filePath}`,
+            };
+          }
+        } catch {
+          // Si no existe contenido previo válido, permitimos escribir para no bloquear bootstrap inicial.
+        }
+      }
+    }
+
     const dir = path.dirname(filePath);
     
     // Crear directorios si no existen
@@ -917,7 +1023,7 @@ async function tryGroqProviders(
 // PARSING DE JSON
 // ═══════════════════════════════════════════════════════════════
 
-function parseJSONResponse<T>(response: string): T | null {
+function parseJSONResponseWithDiagnostics<T>(response: string): { data: T | null; error: string | null } {
   const normalize = (text: string): string => text
     .replace(/^\uFEFF/, '')
     .replace(/[“”]/g, '"')
@@ -965,6 +1071,54 @@ function parseJSONResponse<T>(response: string): T | null {
     return text;
   };
 
+  const normalizeSingleQuotedFieldValues = (input: string): string => {
+    // Convierte pares tipo "clave": 'valor' a JSON válido con comillas dobles,
+    // sin tocar comillas simples que estén dentro de strings ya delimitados con ".
+    return input.replace(/("[A-Za-z0-9_]+"\s*:\s*)'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, keyPrefix: string, rawValue: string) => {
+      const safeValue = String(rawValue || '').replace(/"/g, '\\"');
+      return `${keyPrefix}"${safeValue}"`;
+    });
+  };
+
+  const escapeInvalidBackslashesInJsonStrings = (input: string): string => {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+
+      if (!inString) {
+        out += ch;
+        if (ch === '"' && !escaped) inString = true;
+        escaped = ch === '\\' && !escaped;
+        continue;
+      }
+
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+
+      if (ch === '\\') {
+        const next = input[i + 1] || '';
+        if (!next || !/["\\\/bfnrtu]/.test(next)) {
+          out += '\\\\';
+        } else {
+          out += '\\';
+        }
+        escaped = true;
+        continue;
+      }
+
+      out += ch;
+      if (ch === '"') inString = false;
+    }
+
+    return out;
+  };
+
   const repairCommonJsonIssues = (raw: string): string => {
     const noFences = normalize(raw)
       .replace(/^```json\s*/i, '')
@@ -981,26 +1135,47 @@ function parseJSONResponse<T>(response: string): T | null {
       'razon',
       'justificacion',
       'causa_raiz',
+      'url',
+      'nombre',
+      'id',
+      'nivel',
+      'motivo_omision',
+      'stack',
+      'tipo_proyecto',
+      'salida_esperada',
+      'salida_error',
+      'comparador',
+      'progreso',
+      'siguiente_fase',
+      'siguiente_bloque',
+      'operacion',
+      'ruta',
+      'accion',
     ]);
 
-    return escapedFieldValues
+    const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues);
+
+    return escapeInvalidBackslashesInJsonStrings(normalizedSingleQuotes)
       .replace(/,\s*([}\]])/g, '$1')
       .trim();
   };
+
+  let lastError = 'JSON inválido';
 
   const tryParse = (raw: string): T | null => {
     const clean = repairCommonJsonIssues(raw);
 
     try {
       return JSON.parse(clean) as T;
-    } catch {
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
       return null;
     }
   };
 
   // 1) Intento directo
   const direct = tryParse(response);
-  if (direct) return direct;
+  if (direct) return { data: direct, error: null };
 
   // 2) Intento en bloques markdown
   const fencedBlocks = [
@@ -1009,7 +1184,7 @@ function parseJSONResponse<T>(response: string): T | null {
   ];
   for (const block of fencedBlocks) {
     const parsed = tryParse(block[1] || block[0]);
-    if (parsed) return parsed;
+    if (parsed) return { data: parsed, error: null };
   }
 
   // 3) Extraer por llaves balanceadas (evita regex greedy/noisy)
@@ -1057,10 +1232,58 @@ function parseJSONResponse<T>(response: string): T | null {
 
   for (const candidate of candidates) {
     const parsed = tryParse(candidate);
-    if (parsed) return parsed;
+    if (parsed) return { data: parsed, error: null };
   }
 
-  return null;
+  // 4) Fallback agresivo: desde la primera '{' hasta la última '}'
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const parsed = tryParse(text.slice(firstBrace, lastBrace + 1));
+    if (parsed) return { data: parsed, error: null };
+  }
+
+  return { data: null, error: lastError };
+}
+
+function parseJSONResponse<T>(response: string): T | null {
+  return parseJSONResponseWithDiagnostics<T>(response).data;
+}
+
+async function requestAndParseWithRetry<T>(
+  sendPrompt: (prompt: string) => Promise<{ success: boolean; response?: string; error?: string }>,
+  initialPrompt: string,
+  phaseLabel: string,
+  maxAttempts = 3,
+): Promise<{ parsed: T | null; rawResponse: string; error: string | null; attempts: number }> {
+  let prompt = initialPrompt;
+  let lastRaw = '';
+  let lastError: string | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const promptResult = await sendPrompt(prompt);
+    if (!promptResult.success) {
+      return {
+        parsed: null,
+        rawResponse: lastRaw,
+        error: promptResult.error || `Error enviando prompt (${phaseLabel})`,
+        attempts: attempt,
+      };
+    }
+
+    const rawResponse = promptResult.response || '';
+    lastRaw = rawResponse;
+    const parsedResult = parseJSONResponseWithDiagnostics<T>(rawResponse);
+    if (parsedResult.data) {
+      return { parsed: parsedResult.data, rawResponse, error: null, attempts: attempt };
+    }
+
+    lastError = parsedResult.error || 'JSON inválido';
+    const rawPreview = rawResponse.slice(0, 3000);
+    prompt = `${initialPrompt}\n\nREINTENTO DE PARSEO #${attempt} (${phaseLabel}):\nTu respuesta anterior no se pudo parsear como JSON.\nError detectado: ${lastError}\n\nRESPUESTA PREVIA (recortada):\n${rawPreview}\n\nCorrige ÚNICAMENTE el formato para que sea JSON válido según el esquema solicitado.\n- No agregues texto fuera del objeto JSON\n- Escapa comillas internas con \\\"\n- Escapa rutas Windows con doble backslash (ejemplo: F:\\\\Desarrollo\\\\proyecto)\n- No uses markdown ni enlaces en formato [texto](url); usa string plano.`;
+  }
+
+  return { parsed: null, rawResponse: lastRaw, error: lastError, attempts: maxAttempts };
 }
 
 
@@ -1140,6 +1363,7 @@ REGLAS:
 31. NO incluyas navegadores web como requisito, ni comandos de verificación/instalación de navegadores
 32. validacion_final debe producir una salida binaria inequívoca: "OK" o "ERROR"
 33. Minimiza dependencias y evita sobreingeniería: elige siempre la opción de menor complejidad que cumpla el objetivo
+34. Para verificar Visual Studio Code en PowerShell, extrae una versión semántica válida (ej: $v = (code --version | Where-Object { $_ -match '^\\d+\\.\\d+' } | Select-Object -First 1)) antes de usar [version]
 
 OBJETIVO RECIBIDO:
 ${userObjective}
@@ -1235,6 +1459,11 @@ REGLAS:
 8. El bloque de validacion debe contener un comando ejecutable que confirme la estructura
 9. Si usas generadores CLI y ya existe RUTA BASE DEL PROYECTO, NO uses rutas absolutas en --directory; usa nombre relativo o solo nombre de proyecto
 10. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido
+11. En validaciones PowerShell, usa operadores lógicos entre expresiones (ejemplo: if ((Test-Path "a") -and (Test-Path "b")) { "OK" } else { "ERROR" }); nunca uses -and como parámetro de Test-Path
+12. FASE 2 es SOLO scaffolding: crea estructura inicial (carpetas/archivos base) sin contenido funcional del negocio
+13. Si el stack tiene generadores oficiales (Angular/Nest/etc.), usa esos comandos para crear componentes/servicios y NO escribas contenido manual personalizado en FASE 2
+14. No encadenes múltiples operaciones en un mismo comando; usa pasos separados y atómicos (un comando por operación)
+15. Evita usar ';' para separar acciones en comandos de scaffolding; genera pasos independientes
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1328,10 +1557,16 @@ REGLAS:
 9. El campo "bloques_pendientes" debe listar todos los bloques que faltan después del actual
 10. No incluyas campos ni llaves fuera del esquema JSON definido
 11. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
-12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \" (ejemplo: \"texto\")
+12. En campos "contenido", "comando", "instruccion" y "descripcion", escapa TODAS las comillas internas con \\" (ejemplo: \\"texto\\")
 13. No uses markdown (sin enlaces tipo [texto](url), sin bloques fenced), solo strings JSON puros
 14. Si incluyes comandos PowerShell con rutas, usa comillas escapadas válidas dentro del JSON
 15. No encadenes múltiples objetos JSON en una sola respuesta; devuelve exactamente UN objeto raíz
+16. Trata "RUTA DEL PROYECTO" como raíz obligatoria de escritura; NUNCA devuelvas rutas absolutas ni salgas de esa raíz
+17. Si la estructura existente ya contiene archivos Angular standalone (por ejemplo src/app/app.ts, src/app/app.html, src/app/app.css), reutiliza ESOS nombres y NO inventes app.component.ts/app.component.html/app.component.css
+18. Solo modifica/crea rutas coherentes con "ESTRUCTURA CREADA EN FASE 2"; si necesitas un archivo nuevo, colócalo dentro de carpetas ya existentes del proyecto
+19. No propongas crear archivos en prefijos de workspace ajenos (ej. src/... fuera del proyecto o rutas al nivel del workspace padre)
+20. En el primer bloque, prioriza actualizar los archivos base detectados en la estructura real antes de crear rutas alternativas
+21. Evita comandos de parcheo incremental como Add-Content para TypeScript crítico; cuando debas cambiar código Angular, devuelve el archivo completo en "archivos" con operacion "modificar"
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1348,6 +1583,98 @@ RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
   "progreso": "[porcentaje]",
   "siguiente_bloque": "[id siguiente | null si último]",
   "siguiente_fase": "[null si hay más bloques | 4 — Validación y pruebas si último]"
+}`;
+}
+
+
+function buildPhase4Prompt(
+  systemInfo: SystemInfo,
+  userObjective: string,
+  decisiones1A: Decision[],
+  estructura2: Record<string, unknown>,
+  bloquesCompletados: string[],
+  projectPath: string
+): string {
+  const decisionesStr = JSON.stringify(decisiones1A, null, 2);
+  const estructuraStr = JSON.stringify(estructura2, null, 2);
+  const bloquesStr = bloquesCompletados.length > 0 ? bloquesCompletados.join(', ') : 'Ninguno';
+
+  return `Eres un generador de validaciones para un agente automatizado.
+Tu función es generar todas las pruebas necesarias para confirmar que
+el proyecto completo funciona correctamente antes de la entrega.
+
+CONTEXTO:
+- Esta es la FASE 4 del flujo de trabajo
+- Todos los bloques del proyecto fueron desarrollados en FASE 3
+- Tu respuesta será procesada directamente por el agente, NO por un humano
+- El agente ejecutará cada validación exactamente como la indiques
+- Si una validación falla el agente disparará el prompt de error automáticamente
+- TODOS los comandos deben ser ejecutables en ${systemInfo.shell_disponible}
+
+ENTORNO DEL AGENTE:
+- Sistema Operativo: ${systemInfo.os_nombre} ${systemInfo.os_version}
+- Arquitectura: ${systemInfo.arquitectura}
+- Shell disponible: ${systemInfo.shell_disponible}
+- Gestor de paquetes: ${systemInfo.gestor_paquetes}
+
+DECISIONES TOMADAS EN FASE 1A:
+${decisionesStr}
+
+ESTRUCTURA DEL PROYECTO:
+${estructuraStr}
+
+BLOQUES DESARROLLADOS EN FASE 3:
+${bloquesStr}
+
+OBJETIVO DEL PROYECTO:
+${userObjective}
+
+RUTA DEL PROYECTO:
+${projectPath}
+
+REGLAS:
+1. TODOS los comandos deben estar escritos en sintaxis válida para ${systemInfo.shell_disponible}
+2. Genera validaciones para los 5 niveles: build, estructura, funcionalidad, responsividad y performance. Si algún nivel no aplica para el stack indicado en DECISIONES_1A, omítelo con una justificación en el campo "motivo_omision"
+3. Cada validación debe tener un comando ejecutable con salida esperada concreta y comparador. Nunca uses instrucciones para humanos como "verificar visualmente" como única validación
+4. Las validaciones deben ejecutarse en orden estricto. Si una falla las siguientes no se ejecutan hasta que se corrija
+5. Si el stack NO tiene framework (HTML puro), adapta las validaciones: verifica existencia de archivos, ausencia de links rotos y apertura correcta en navegador
+6. El campo "comando" de cada validacion debe tener comillas internas escapadas con \\" para garantizar JSON válido
+7. El bloque "resumen_final" debe contener un único comando que ejecute el proyecto completo y confirme que está listo para entrega
+8. No incluyas campos ni llaves fuera del esquema JSON definido
+9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
+
+RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
+
+{
+  "fase": "4",
+  "accion": "validacion_completa",
+  "stack": "[stack tecnologico del proyecto]",
+  "tipo_proyecto": "[con_framework | sin_framework]",
+  "descripcion": "[resumen de qué se va a validar y por qué]",
+  "validaciones": [
+    {
+      "id": "[id unico de la validacion, ej: val_01_build]",
+      "nivel": "[build | estructura | funcionalidad | responsividad | performance]",
+      "nombre": "[nombre legible de la validacion]",
+      "descripcion": "[qué se está verificando exactamente]",
+      "motivo_omision": null,
+      "comando": "[comando ejecutable en ${systemInfo.shell_disponible}]",
+      "salida_esperada": "[patron o valor que confirma que la validacion pasó]",
+      "salida_error": "[patron o valor que indica que falló]",
+      "comparador": "[contains | equals | startsWith | greaterThan | exists]",
+      "critico": true,
+      "accion_si_falla": "[descripcion de qué debe hacer el agente si esta validacion falla]"
+    }
+  ],
+  "resumen_final": {
+    "comando": "[comando en ${systemInfo.shell_disponible} que levanta el proyecto completo listo para revisión]",
+    "url": "[url donde se visualiza el proyecto completo | null si no aplica]",
+    "salida_esperada": "[patron que confirma que el proyecto está corriendo sin errores]",
+    "salida_error": "[patron que indica que algo falla al levantar]",
+    "comparador": "[contains | equals | startsWith]"
+  },
+  "progreso": "90%",
+  "siguiente_fase": "5 — Entrega"
 }`;
 }
 
@@ -1967,17 +2294,26 @@ export async function POST(request: NextRequest) {
         sessionState.completedBlocks
       );
       
-      const promptResult = await sendPrompt(phase3Prompt);
-      
-      if (!promptResult.success) {
-        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      const phase3Request = await requestAndParseWithRetry<Phase3Response>(
+        sendPrompt,
+        phase3Prompt,
+        'FASE 3',
+        3,
+      );
+      if (!phase3Request.parsed) {
+        return NextResponse.json({
+          success: false,
+          error: `No se pudo parsear desarrollo tras ${phase3Request.attempts} intentos${phase3Request.error ? `: ${phase3Request.error}` : ''}`,
+          rawResponse: phase3Request.rawResponse.substring(0, 2000),
+          systemInfo,
+        });
       }
 
-      const phase3Result = parseJSONResponse<Phase3Response>(promptResult.response);
+      const phase3Result = phase3Request.parsed;
       if (!phase3Result) {
         return NextResponse.json({
           success: false, error: 'No se pudo parsear desarrollo',
-          rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+          rawResponse: phase3Request.rawResponse.substring(0, 2000), systemInfo,
         });
       }
 
@@ -2026,7 +2362,106 @@ export async function POST(request: NextRequest) {
         siguienteFase: phase3Result.siguiente_fase,
         workDir: sessionState.currentWorkDir,
         systemInfo,
-        rawResponse: promptResult.response,
+        rawResponse: phase3Request.rawResponse,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ACCIÓN: FASE 4 - VALIDACIÓN COMPLETA
+    // ════════════════════════════════════════════════════════════
+    if (action === 'phase_4') {
+      if (!sessionState.phase1AResult || !sessionState.phase2Result) {
+        return NextResponse.json({ success: false, error: 'FASE 1A o FASE 2 no completadas' });
+      }
+
+      let browserModule;
+      try {
+        browserModule = await import('../../../lib/browser');
+      } catch {
+        return NextResponse.json({ success: false, error: 'Playwright no disponible' });
+      }
+
+      const { sendPrompt } = browserModule;
+
+      const resolvedProjectRoot = await resolveProjectRootPath();
+      sessionState.currentWorkDir = resolvedProjectRoot;
+      sessionState.projectPath = resolvedProjectRoot;
+      const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
+
+      console.log('[FASE 4] Enviando prompt de validación...');
+      const phase4Prompt = buildPhase4Prompt(
+        systemInfo,
+        message || '',
+        sessionState.phase1AResult.decisiones_tomadas,
+        realStructureSnapshot,
+        sessionState.completedBlocks,
+        resolvedProjectRoot,
+      );
+
+      const phase4Request = await requestAndParseWithRetry<Phase4Response>(
+        sendPrompt,
+        phase4Prompt,
+        'FASE 4',
+        3,
+      );
+      if (!phase4Request.parsed) {
+        return NextResponse.json({
+          success: false,
+          error: `No se pudo parsear validación FASE 4 tras ${phase4Request.attempts} intentos${phase4Request.error ? `: ${phase4Request.error}` : ''}`,
+          rawResponse: phase4Request.rawResponse.substring(0, 2000),
+          systemInfo,
+        });
+      }
+
+      const phase4Result = phase4Request.parsed;
+      if (!phase4Result) {
+        return NextResponse.json({
+          success: false,
+          error: 'No se pudo parsear validación FASE 4',
+          rawResponse: phase4Request.rawResponse.substring(0, 2000),
+          systemInfo,
+        });
+      }
+
+      const executionSteps: ExecutionStep[] = [];
+
+      phase4Result.validaciones?.forEach((val, idx) => {
+        if (!val?.comando) return;
+        executionSteps.push({
+          id: `fase4-val-${idx}`,
+          fase: '4',
+          paso: val.nombre || `Validación ${idx + 1}`,
+          accion: 'validar',
+          descripcion: val.descripcion || val.nombre || `Validación ${idx + 1}`,
+          status: 'pending',
+          comandos: [val.comando],
+          validacion: `Debe mostrar: ${val.salida_esperada || 'OK'}`,
+          tipo: val.nivel,
+        });
+      });
+
+      if (phase4Result.resumen_final?.comando) {
+        executionSteps.push({
+          id: 'fase4-resumen-final',
+          fase: '4',
+          paso: 'Resumen final de validación',
+          accion: 'validar',
+          descripcion: 'Ejecutar verificación final del proyecto listo para entrega',
+          status: 'pending',
+          comandos: [phase4Result.resumen_final.comando],
+          validacion: `Debe mostrar: ${phase4Result.resumen_final.salida_esperada || 'OK'}`,
+          tipo: 'resumen_final',
+        });
+      }
+
+      return NextResponse.json({
+        success: true,
+        fase: '4',
+        phase4Result,
+        executionSteps,
+        workDir: sessionState.currentWorkDir,
+        systemInfo,
+        rawResponse: phase4Request.rawResponse,
       });
     }
 
@@ -2225,6 +2660,6 @@ export async function GET() {
   return NextResponse.json({
     message: 'Sonny Agent Process API v2.1',
     phases: ['1A - Análisis', '1B - Instalación', '2 - Scaffolding', '3 - Desarrollo', '4 - Validación'],
-    actions: ['process', 'phase_1a', 'phase_2', 'phase_3', 'execute', 'report_error', 'complete_block'],
+    actions: ['process', 'phase_1a', 'phase_2', 'phase_3', 'phase_4', 'execute', 'report_error', 'complete_block'],
   });
 }
