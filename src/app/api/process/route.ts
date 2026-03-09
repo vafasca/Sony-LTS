@@ -760,7 +760,7 @@ function normalizeProjectRelativePath(inputPath: string): string {
 }
 
 
-async function resolveProjectRootPath(): Promise<string> {
+async function resolveProjectRootPath(preferredProjectFolder?: string | null): Promise<string> {
   const candidates: string[] = [];
 
   const addCandidate = (candidate?: string | null) => {
@@ -771,6 +771,9 @@ async function resolveProjectRootPath(): Promise<string> {
       candidates.push(trimmed);
     }
   };
+
+  // Prioridad máxima: carpeta del proyecto enviada por frontend (si existe).
+  addCandidate(preferredProjectFolder || null);
 
   const phase2ProjectName = sessionState.phase2Result?.nombre_proyecto;
 
@@ -1567,6 +1570,11 @@ REGLAS:
 19. No propongas crear archivos en prefijos de workspace ajenos (ej. src/... fuera del proyecto o rutas al nivel del workspace padre)
 20. En el primer bloque, prioriza actualizar los archivos base detectados en la estructura real antes de crear rutas alternativas
 21. Evita comandos de parcheo incremental como Add-Content para TypeScript crítico; cuando debas cambiar código Angular, devuelve el archivo completo en "archivos" con operacion "modificar"
+22. El objeto final DEBE poder parsearse directamente con JSON.parse() sin preprocesamiento
+23. No uses enlaces markdown dentro de strings (ejemplo prohibido: [texto](url)); usa texto plano o URL plana
+24. En HTML dentro de "contenido", escapa SIEMPRE las comillas dobles como \" para no romper el JSON
+25. En comandos/rutas Windows dentro de strings JSON, escapa backslashes con doble barra (ejemplo: F:\\Desarrollo\\mi-proyecto)
+26. Si dudas de formato, prioriza JSON válido aunque el contenido sea más simple
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1642,6 +1650,10 @@ REGLAS:
 7. El bloque "resumen_final" debe contener un único comando que ejecute el proyecto completo y confirme que está listo para entrega
 8. No incluyas campos ni llaves fuera del esquema JSON definido
 9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
+10. El objeto final DEBE poder parsearse directamente con JSON.parse() sin preprocesamiento
+11. No uses enlaces markdown dentro de strings (ejemplo prohibido: [texto](url)); usa texto plano o URL plana
+12. En comandos PowerShell con rutas Windows dentro de JSON, escapa backslashes con doble barra (ejemplo: F:\\Desarrollo\\mi-proyecto)
+13. En strings con comillas dobles internas, escápalas como \" para no romper el JSON
 
 RESPONDE ÚNICAMENTE CON EL SIGUIENTE JSON SIN TEXTO ADICIONAL:
 
@@ -1803,15 +1815,24 @@ export async function POST(request: NextRequest) {
         await openSite(selectedProvider);
       }
       
-      const promptResult = await sendPrompt(errorPrompt);
-      
-      if (!promptResult.success) {
-        return NextResponse.json({ success: false, error: promptResult.error });
+      const retryParsed = await requestAndParseWithRetry<Record<string, unknown>>(
+        sendPrompt,
+        errorPrompt,
+        'CORRECCIÓN DE ERROR',
+        3,
+      );
+
+      if (!retryParsed.parsed) {
+        return NextResponse.json({
+          success: false,
+          error: `No se pudo parsear solución de corrección tras ${retryParsed.attempts} intentos${retryParsed.error ? `: ${retryParsed.error}` : ''}`,
+          rawResponse: retryParsed.rawResponse.substring(0, 2000),
+        });
       }
-      
-      const solution = parseJSONResponse(promptResult.response);
-      
-      return NextResponse.json({ success: true, solution, rawResponse: promptResult.response });
+
+      const solution = retryParsed.parsed;
+
+      return NextResponse.json({ success: true, solution, rawResponse: retryParsed.rawResponse });
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1838,6 +1859,19 @@ export async function POST(request: NextRequest) {
           console.log(`[Execute] ⚠️ workDir recibido no existe: ${body.workDir}. Se mantiene: ${sessionState.currentWorkDir}`);
         }
       }
+
+      // Fallback robusto: si el cwd actual no contiene package.json/angular.json y tenemos
+      // projectFolder en el request, re-resolver al root real del proyecto.
+      const cwdPackageJson = path.join(sessionState.currentWorkDir, 'package.json');
+      const cwdAngularJson = path.join(sessionState.currentWorkDir, 'angular.json');
+      const cwdLooksLikeProject = await pathExists(cwdPackageJson) || await pathExists(cwdAngularJson);
+      if (!cwdLooksLikeProject) {
+        const resolvedRoot = await resolveProjectRootPath(body.projectFolder as string | undefined);
+        if (await pathExists(resolvedRoot)) {
+          sessionState.currentWorkDir = resolvedRoot;
+          console.log(`[Execute] ℹ️ workDir corregido automáticamente a: ${resolvedRoot}`);
+        }
+      }
       
       // Recuperar intentos previos del body o usar objeto vacío
       const previousAttempts: Record<number, number> = body.retryAttempts || {};
@@ -1862,7 +1896,7 @@ export async function POST(request: NextRequest) {
           for (const cmd of step.comandos) {
             console.log(`[Execute] Paso ${i + 1}, intento ${stepAttempts + 1}, comando: ${cmd}`);
             const cmdResult = await executeCommand(cmd, systemInfo);
-            result.outputs.push(`$ ${cmd}\n${cmdResult.output}`);
+            result.outputs.push(`$ ${cmd}\n${stripAnsi(cmdResult.output)}`);
             
             if (!cmdResult.success) {
               const isVerificationStep = step.accion === 'verificar';
@@ -1909,7 +1943,7 @@ export async function POST(request: NextRequest) {
                 paso: step.descripcion || step.paso || 'Ejecución',
                 accion_ejecutada: cmd,
                 tipo_error: 'comando',
-                mensaje_error: cmdResult.output,
+                mensaje_error: stripAnsi(cmdResult.output),
                 codigo_salida: cmdResult.exitCode,
                 archivo_afectado: null,
                 linea_error: null,
@@ -1980,7 +2014,7 @@ export async function POST(request: NextRequest) {
                 paso: step.descripcion || 'Creación de archivo',
                 accion_ejecutada: `Crear archivo: ${archivo.nombre || archivo.ruta}`,
                 tipo_error: 'codigo',
-                mensaje_error: fileResult.message,
+                mensaje_error: stripAnsi(fileResult.message),
                 codigo_salida: null,
                 archivo_afectado: archivo.nombre || archivo.ruta || null,
                 linea_error: null,
@@ -2278,7 +2312,7 @@ export async function POST(request: NextRequest) {
 
       const { sendPrompt } = browserModule;
       
-      const resolvedProjectRoot = await resolveProjectRootPath();
+      const resolvedProjectRoot = await resolveProjectRootPath(projectFolder);
       sessionState.currentWorkDir = resolvedProjectRoot;
       sessionState.projectPath = resolvedProjectRoot;
       const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
@@ -2383,7 +2417,7 @@ export async function POST(request: NextRequest) {
 
       const { sendPrompt } = browserModule;
 
-      const resolvedProjectRoot = await resolveProjectRootPath();
+      const resolvedProjectRoot = await resolveProjectRootPath(projectFolder);
       sessionState.currentWorkDir = resolvedProjectRoot;
       sessionState.projectPath = resolvedProjectRoot;
       const realStructureSnapshot = await buildProjectStructureSnapshot(resolvedProjectRoot);
