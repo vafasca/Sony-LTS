@@ -1071,18 +1071,13 @@ function parseJSONResponse<T>(response: string): T | null {
     return text;
   };
 
-  const normalizeSingleQuotedFieldValues = (input: string, fieldNames: string[]): string => {
-    let text = input;
-
-    for (const field of fieldNames) {
-      const pattern = new RegExp(`"${field}"\\s*:\\s*'([^'\\\\]*(?:\\\\.[^'\\\\]*)*)'`, 'g');
-      text = text.replace(pattern, (_match, group: string) => {
-        const safeGroup = String(group || '').replace(/"/g, '\\"');
-        return `"${field}": "${safeGroup}"`;
-      });
-    }
-
-    return text;
+  const normalizeSingleQuotedFieldValues = (input: string): string => {
+    // Convierte pares tipo "clave": 'valor' a JSON válido con comillas dobles,
+    // sin tocar comillas simples que estén dentro de strings ya delimitados con ".
+    return input.replace(/("[A-Za-z0-9_]+"\s*:\s*)'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, keyPrefix: string, rawValue: string) => {
+      const safeValue = String(rawValue || '').replace(/"/g, '\\"');
+      return `${keyPrefix}"${safeValue}"`;
+    });
   };
 
   const repairCommonJsonIssues = (raw: string): string => {
@@ -1103,22 +1098,7 @@ function parseJSONResponse<T>(response: string): T | null {
       'causa_raiz',
     ]);
 
-    const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues, [
-      'salida_esperada',
-      'salida_error',
-      'comparador',
-      'progreso',
-      'siguiente_fase',
-      'stack',
-      'tipo_proyecto',
-      'accion',
-      'fase',
-      'id',
-      'nivel',
-      'nombre',
-      'motivo_omision',
-      'url',
-    ]);
+    const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues);
 
     return normalizedSingleQuotes
       .replace(/,\s*([}\]])/g, '$1')
@@ -1552,7 +1532,7 @@ REGLAS:
 3. Cada validación debe tener un comando ejecutable con salida esperada concreta y comparador. Nunca uses instrucciones para humanos como "verificar visualmente" como única validación
 4. Las validaciones deben ejecutarse en orden estricto. Si una falla las siguientes no se ejecutan hasta que se corrija
 5. Si el stack NO tiene framework (HTML puro), adapta las validaciones: verifica existencia de archivos, ausencia de links rotos y apertura correcta en navegador
-6. El campo "comando" de cada validacion debe tener comillas internas escapadas con " para garantizar JSON válido
+6. El campo "comando" de cada validacion debe tener comillas internas escapadas con \" para garantizar JSON válido
 7. El bloque "resumen_final" debe contener un único comando que ejecute el proyecto completo y confirme que está listo para entrega
 8. No incluyas campos ni llaves fuera del esquema JSON definido
 9. NUNCA respondas en texto plano. SIEMPRE responde en JSON válido sin texto adicional
