@@ -1023,7 +1023,7 @@ async function tryGroqProviders(
 // PARSING DE JSON
 // ═══════════════════════════════════════════════════════════════
 
-function parseJSONResponse<T>(response: string): T | null {
+function parseJSONResponseWithDiagnostics<T>(response: string): { data: T | null; error: string | null } {
   const normalize = (text: string): string => text
     .replace(/^\uFEFF/, '')
     .replace(/[“”]/g, '"')
@@ -1080,6 +1080,45 @@ function parseJSONResponse<T>(response: string): T | null {
     });
   };
 
+  const escapeInvalidBackslashesInJsonStrings = (input: string): string => {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+
+      if (!inString) {
+        out += ch;
+        if (ch === '"' && !escaped) inString = true;
+        escaped = ch === '\\' && !escaped;
+        continue;
+      }
+
+      if (escaped) {
+        out += ch;
+        escaped = false;
+        continue;
+      }
+
+      if (ch === '\\') {
+        const next = input[i + 1] || '';
+        if (!next || !/["\\\/bfnrtu]/.test(next)) {
+          out += '\\\\';
+        } else {
+          out += '\\';
+        }
+        escaped = true;
+        continue;
+      }
+
+      out += ch;
+      if (ch === '"') inString = false;
+    }
+
+    return out;
+  };
+
   const repairCommonJsonIssues = (raw: string): string => {
     const noFences = normalize(raw)
       .replace(/^```json\s*/i, '')
@@ -1116,24 +1155,27 @@ function parseJSONResponse<T>(response: string): T | null {
 
     const normalizedSingleQuotes = normalizeSingleQuotedFieldValues(escapedFieldValues);
 
-    return normalizedSingleQuotes
+    return escapeInvalidBackslashesInJsonStrings(normalizedSingleQuotes)
       .replace(/,\s*([}\]])/g, '$1')
       .trim();
   };
+
+  let lastError = 'JSON inválido';
 
   const tryParse = (raw: string): T | null => {
     const clean = repairCommonJsonIssues(raw);
 
     try {
       return JSON.parse(clean) as T;
-    } catch {
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
       return null;
     }
   };
 
   // 1) Intento directo
   const direct = tryParse(response);
-  if (direct) return direct;
+  if (direct) return { data: direct, error: null };
 
   // 2) Intento en bloques markdown
   const fencedBlocks = [
@@ -1142,7 +1184,7 @@ function parseJSONResponse<T>(response: string): T | null {
   ];
   for (const block of fencedBlocks) {
     const parsed = tryParse(block[1] || block[0]);
-    if (parsed) return parsed;
+    if (parsed) return { data: parsed, error: null };
   }
 
   // 3) Extraer por llaves balanceadas (evita regex greedy/noisy)
@@ -1190,7 +1232,7 @@ function parseJSONResponse<T>(response: string): T | null {
 
   for (const candidate of candidates) {
     const parsed = tryParse(candidate);
-    if (parsed) return parsed;
+    if (parsed) return { data: parsed, error: null };
   }
 
   // 4) Fallback agresivo: desde la primera '{' hasta la última '}'
@@ -1198,10 +1240,50 @@ function parseJSONResponse<T>(response: string): T | null {
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace >= 0 && lastBrace > firstBrace) {
     const parsed = tryParse(text.slice(firstBrace, lastBrace + 1));
-    if (parsed) return parsed;
+    if (parsed) return { data: parsed, error: null };
   }
 
-  return null;
+  return { data: null, error: lastError };
+}
+
+function parseJSONResponse<T>(response: string): T | null {
+  return parseJSONResponseWithDiagnostics<T>(response).data;
+}
+
+async function requestAndParseWithRetry<T>(
+  sendPrompt: (prompt: string) => Promise<{ success: boolean; response?: string; error?: string }>,
+  initialPrompt: string,
+  phaseLabel: string,
+  maxAttempts = 3,
+): Promise<{ parsed: T | null; rawResponse: string; error: string | null; attempts: number }> {
+  let prompt = initialPrompt;
+  let lastRaw = '';
+  let lastError: string | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const promptResult = await sendPrompt(prompt);
+    if (!promptResult.success) {
+      return {
+        parsed: null,
+        rawResponse: lastRaw,
+        error: promptResult.error || `Error enviando prompt (${phaseLabel})`,
+        attempts: attempt,
+      };
+    }
+
+    const rawResponse = promptResult.response || '';
+    lastRaw = rawResponse;
+    const parsedResult = parseJSONResponseWithDiagnostics<T>(rawResponse);
+    if (parsedResult.data) {
+      return { parsed: parsedResult.data, rawResponse, error: null, attempts: attempt };
+    }
+
+    lastError = parsedResult.error || 'JSON inválido';
+    const rawPreview = rawResponse.slice(0, 3000);
+    prompt = `${initialPrompt}\n\nREINTENTO DE PARSEO #${attempt} (${phaseLabel}):\nTu respuesta anterior no se pudo parsear como JSON.\nError detectado: ${lastError}\n\nRESPUESTA PREVIA (recortada):\n${rawPreview}\n\nCorrige ÚNICAMENTE el formato para que sea JSON válido según el esquema solicitado.\n- No agregues texto fuera del objeto JSON\n- Escapa comillas internas con \\\"\n- Escapa rutas Windows con doble backslash (ejemplo: F:\\\\Desarrollo\\\\proyecto)\n- No uses markdown ni enlaces en formato [texto](url); usa string plano.`;
+  }
+
+  return { parsed: null, rawResponse: lastRaw, error: lastError, attempts: maxAttempts };
 }
 
 
@@ -2212,17 +2294,26 @@ export async function POST(request: NextRequest) {
         sessionState.completedBlocks
       );
       
-      const promptResult = await sendPrompt(phase3Prompt);
-      
-      if (!promptResult.success) {
-        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      const phase3Request = await requestAndParseWithRetry<Phase3Response>(
+        sendPrompt,
+        phase3Prompt,
+        'FASE 3',
+        3,
+      );
+      if (!phase3Request.parsed) {
+        return NextResponse.json({
+          success: false,
+          error: `No se pudo parsear desarrollo tras ${phase3Request.attempts} intentos${phase3Request.error ? `: ${phase3Request.error}` : ''}`,
+          rawResponse: phase3Request.rawResponse.substring(0, 2000),
+          systemInfo,
+        });
       }
 
-      const phase3Result = parseJSONResponse<Phase3Response>(promptResult.response);
+      const phase3Result = phase3Request.parsed;
       if (!phase3Result) {
         return NextResponse.json({
           success: false, error: 'No se pudo parsear desarrollo',
-          rawResponse: promptResult.response.substring(0, 2000), systemInfo,
+          rawResponse: phase3Request.rawResponse.substring(0, 2000), systemInfo,
         });
       }
 
@@ -2271,7 +2362,7 @@ export async function POST(request: NextRequest) {
         siguienteFase: phase3Result.siguiente_fase,
         workDir: sessionState.currentWorkDir,
         systemInfo,
-        rawResponse: promptResult.response,
+        rawResponse: phase3Request.rawResponse,
       });
     }
 
@@ -2307,17 +2398,27 @@ export async function POST(request: NextRequest) {
         resolvedProjectRoot,
       );
 
-      const promptResult = await sendPrompt(phase4Prompt);
-      if (!promptResult.success) {
-        return NextResponse.json({ success: false, error: promptResult.error, systemInfo });
+      const phase4Request = await requestAndParseWithRetry<Phase4Response>(
+        sendPrompt,
+        phase4Prompt,
+        'FASE 4',
+        3,
+      );
+      if (!phase4Request.parsed) {
+        return NextResponse.json({
+          success: false,
+          error: `No se pudo parsear validación FASE 4 tras ${phase4Request.attempts} intentos${phase4Request.error ? `: ${phase4Request.error}` : ''}`,
+          rawResponse: phase4Request.rawResponse.substring(0, 2000),
+          systemInfo,
+        });
       }
 
-      const phase4Result = parseJSONResponse<Phase4Response>(promptResult.response);
+      const phase4Result = phase4Request.parsed;
       if (!phase4Result) {
         return NextResponse.json({
           success: false,
           error: 'No se pudo parsear validación FASE 4',
-          rawResponse: promptResult.response.substring(0, 2000),
+          rawResponse: phase4Request.rawResponse.substring(0, 2000),
           systemInfo,
         });
       }
@@ -2360,7 +2461,7 @@ export async function POST(request: NextRequest) {
         executionSteps,
         workDir: sessionState.currentWorkDir,
         systemInfo,
-        rawResponse: promptResult.response,
+        rawResponse: phase4Request.rawResponse,
       });
     }
 
