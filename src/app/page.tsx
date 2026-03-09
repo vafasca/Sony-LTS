@@ -821,48 +821,75 @@ export default function SonnyAgent() {
             }
           }
 
-          updateMessage(statusMsgId, '🧪 Iniciando FASE 4: validación completa del proyecto...');
-          const phase4Response = await fetch('/api/process', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'phase_4',
-              message: input,
-              aiProvider: selectedAI,
-              groqApiKey,
-              projectFolder,
-            }),
-          });
+          const maxPhase4Rounds = 3;
+          let phase4Validated = false;
 
-          const phase4Data = await phase4Response.json();
-          if (!phase4Response.ok || !phase4Data.success) {
-            updateMessage(statusMsgId, `⚠️ FASE 4 detenida: ${phase4Data.error || 'Error desconocido'}`, 'error');
-            return;
+          for (let validationRound = 1; validationRound <= maxPhase4Rounds; validationRound++) {
+            updateMessage(
+              statusMsgId,
+              `🧪 Iniciando FASE 4: validación completa del proyecto (ronda ${validationRound}/${maxPhase4Rounds})...`,
+            );
+
+            const phase4Response = await fetch('/api/process', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'phase_4',
+                message: input,
+                aiProvider: selectedAI,
+                groqApiKey,
+                projectFolder,
+              }),
+            });
+
+            const phase4Data = await phase4Response.json();
+            if (!phase4Response.ok || !phase4Data.success) {
+              const retryHint = validationRound < maxPhase4Rounds ? ' Reintentando...' : '';
+              updateMessage(
+                statusMsgId,
+                `⚠️ FASE 4 ronda ${validationRound} detenida: ${phase4Data.error || 'Error desconocido'}${retryHint}`,
+                'error',
+              );
+              if (validationRound < maxPhase4Rounds) continue;
+              return;
+            }
+
+            const phase4Steps: ExecutionStep[] = (phase4Data.executionSteps || []).map((step: Record<string, unknown>, index: number) => ({
+              id: `fase4-step-${validationRound}-${index}`,
+              numero: index + 1,
+              fase: (step.fase as string) || '4',
+              accion: (step.accion as ExecutionStep['accion']) || 'validar',
+              descripcion: (step.descripcion as string) || '',
+              status: 'pending' as const,
+              comandos: (step.comandos as string[]) || [],
+              archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
+              validacion: (step.validacion as string) || '',
+            }));
+
+            setExecutionSteps(phase4Steps);
+            const phase4Ok = await executeWithStreaming(phase4Steps, currentProjectRoot || workDir);
+
+            const phase4WorkDir = typeof phase4Data.workDir === 'string' ? phase4Data.workDir : '';
+            if (phase4WorkDir) {
+              setCurrentProjectRoot(phase4WorkDir);
+              await refreshProjectFiles(phase4WorkDir);
+            }
+
+            if (phase4Ok) {
+              phase4Validated = true;
+              break;
+            }
+
+            updateMessage(
+              statusMsgId,
+              `⚠️ FASE 4 ronda ${validationRound} encontró errores críticos. Reintentando validación...`,
+              'error',
+            );
           }
 
-          const phase4Steps: ExecutionStep[] = (phase4Data.executionSteps || []).map((step: Record<string, unknown>, index: number) => ({
-            id: `fase4-step-${index}`,
-            numero: index + 1,
-            fase: (step.fase as string) || '4',
-            accion: (step.accion as ExecutionStep['accion']) || 'validar',
-            descripcion: (step.descripcion as string) || '',
-            status: 'pending' as const,
-            comandos: (step.comandos as string[]) || [],
-            archivos: (step.archivos as Array<{ nombre: string; contenido?: string }>) || [],
-            validacion: (step.validacion as string) || '',
-          }));
-
-          setExecutionSteps(phase4Steps);
-          const phase4Ok = await executeWithStreaming(phase4Steps, currentProjectRoot || workDir);
-          if (!phase4Ok) {
-            updateMessage(statusMsgId, '❌ FASE 4 detenida por error en validaciones críticas', 'error');
+          if (!phase4Validated) {
+            updateMessage(statusMsgId, '❌ FASE 4 detenida tras múltiples rondas de validación', 'error');
             return;
-          }
-
-          const phase4WorkDir = typeof phase4Data.workDir === 'string' ? phase4Data.workDir : '';
-          if (phase4WorkDir) {
-            setCurrentProjectRoot(phase4WorkDir);
-            await refreshProjectFiles(phase4WorkDir);
           }
 
           updateMessage(statusMsgId, '✅ FASE 4 completada. Listo para FASE 5 — Entrega.', 'success');
